@@ -159,6 +159,16 @@ makeWholeRowVar(RangeTblEntry *rte,
 							 varlevelsup);
 			break;
 
+			case RTE_DBLINK:
+				/* Remote @dblink relations don't have a named composite type */
+				result = makeVar(varno,
+							 InvalidAttrNumber,
+							 RECORDOID,
+							 -1,
+							 InvalidOid,
+							 varlevelsup);
+				break;
+
 		case RTE_SUBQUERY:
 
 			/*

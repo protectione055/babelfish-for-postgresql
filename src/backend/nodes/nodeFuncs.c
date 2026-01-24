@@ -2839,6 +2839,9 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
 			if (WALK(rte->tablesample))
 				return true;
 			break;
+		case RTE_DBLINK:
+			/* nothing to do */
+			break;
 		case RTE_SUBQUERY:
 			if (!(flags & QTW_IGNORE_RT_SUBQUERIES))
 				if (WALK(rte->subquery))
@@ -3870,6 +3873,9 @@ range_table_mutator_impl(List *rtable,
 				MUTATE(newrte->tablesample, rte->tablesample,
 					   TableSampleClause *);
 				/* we don't bother to copy eref, aliases, etc; OK? */
+				break;
+			case RTE_DBLINK:
+				/* nothing to do */
 				break;
 			case RTE_SUBQUERY:
 				if (!(flags & QTW_IGNORE_RT_SUBQUERIES))

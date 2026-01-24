@@ -562,10 +562,21 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 		case RTE_RESULT:
 			/* no extra fields */
 			break;
+		case RTE_DBLINK:
+			/* Remote metadata is stored explicitly on the RTE */
+			WRITE_NODE_FIELD(coltypes);
+			WRITE_NODE_FIELD(coltypmods);
+			WRITE_NODE_FIELD(colcollations);
+			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d", (int) node->rtekind);
 			break;
 	}
+
+		WRITE_STRING_FIELD(dblinkname);
+		WRITE_STRING_FIELD(dblinknamespace);
+		WRITE_STRING_FIELD(dblinkrelname);
+		WRITE_UINT64_FIELD(dblink_signature);
 
 	WRITE_BOOL_FIELD(lateral);
 	WRITE_BOOL_FIELD(inFromCl);

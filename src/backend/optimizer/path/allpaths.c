@@ -110,6 +110,10 @@ static void set_foreign_size(PlannerInfo *root, RelOptInfo *rel,
 							 RangeTblEntry *rte);
 static void set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel,
 								 RangeTblEntry *rte);
+static void set_dblink_size(PlannerInfo *root, RelOptInfo *rel,
+						 RangeTblEntry *rte);
+static void set_dblink_pathlist(PlannerInfo *root, RelOptInfo *rel,
+								 RangeTblEntry *rte);
 static void set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 								Index rti, RangeTblEntry *rte);
 static void set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
@@ -411,6 +415,9 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 					set_plain_rel_size(root, rel, rte);
 				}
 				break;
+			case RTE_DBLINK:
+				set_dblink_size(root, rel, rte);
+				break;
 			case RTE_SUBQUERY:
 
 				/*
@@ -498,6 +505,9 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 					/* Plain relation */
 					set_plain_rel_pathlist(root, rel, rte);
 				}
+				break;
+			case RTE_DBLINK:
+				set_dblink_pathlist(root, rel, rte);
 				break;
 			case RTE_SUBQUERY:
 				/* Subquery --- fully handled during set_rel_size */
@@ -656,6 +666,14 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 			 * For now, just set consider_parallel based on the rel's own
 			 * quals and targetlist.
 			 */
+			break;
+		case RTE_DBLINK:
+			/* Delegate to FDW to decide parallel-safety */
+			Assert(rel->fdwroutine);
+			if (!rel->fdwroutine->IsForeignScanParallelSafe)
+				return;
+			if (!rel->fdwroutine->IsForeignScanParallelSafe(root, rel, rte))
+				return;
 			break;
 
 		case RTE_SUBQUERY:
@@ -927,6 +945,44 @@ set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
 	/* Call the FDW's GetForeignPaths function to generate path(s) */
 	rel->fdwroutine->GetForeignPaths(root, rel, rte->relid);
+}
+
+/*
+ * set_dblink_size
+ *		Set size estimates for an @dblink (RTE_DBLINK) scan.
+ *
+ * This is planned similarly to a foreign table, except there is no local
+ * foreign-table OID to pass to the FDW.
+ */
+static void
+set_dblink_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	Assert(rel->fdwroutine);
+
+	/* Mark rel with estimated output rows, width, etc */
+	set_foreign_size_estimates(root, rel);
+
+	/* Let FDW adjust the size estimates */
+	rel->fdwroutine->GetForeignRelSize(root, rel, InvalidOid);
+
+	/* ... but do not let it set the rows estimate to zero */
+	rel->rows = clamp_row_est(rel->rows);
+
+	/* Keep rel->tuples sane relative to rel->rows */
+	rel->tuples = Max(rel->tuples, rel->rows);
+}
+
+/*
+ * set_dblink_pathlist
+ *		Build access paths for an @dblink (RTE_DBLINK) scan.
+ */
+static void
+set_dblink_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	Assert(rel->fdwroutine);
+
+	/* Call the FDW's GetForeignPaths function to generate path(s) */
+	rel->fdwroutine->GetForeignPaths(root, rel, InvalidOid);
 }
 
 /*

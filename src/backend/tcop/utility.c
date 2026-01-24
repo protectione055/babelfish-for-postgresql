@@ -174,6 +174,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_CreateEventTrigStmt:
 		case T_CreateExtensionStmt:
 		case T_CreateFdwStmt:
+		case T_CreateDatabaseLinkStmt:
 		case T_CreateForeignServerStmt:
 		case T_CreateForeignTableStmt:
 		case T_CreateFunctionStmt:
@@ -201,6 +202,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_DropStmt:
 		case T_DropSubscriptionStmt:
 		case T_DropTableSpaceStmt:
+		case T_DropDatabaseLinkStmt:
 		case T_DropUserMappingStmt:
 		case T_DropdbStmt:
 		case T_GrantRoleStmt:
@@ -1620,6 +1622,10 @@ ProcessUtilitySlow(ParseState *pstate,
 				address = CreateUserMapping((CreateUserMappingStmt *) parsetree);
 				break;
 
+			case T_CreateDatabaseLinkStmt:
+				address = CreateDatabaseLink((CreateDatabaseLinkStmt *) parsetree);
+				break;
+
 			case T_AlterUserMappingStmt:
 				address = AlterUserMapping((AlterUserMappingStmt *) parsetree);
 				break;
@@ -1628,6 +1634,10 @@ ProcessUtilitySlow(ParseState *pstate,
 				RemoveUserMapping((DropUserMappingStmt *) parsetree);
 				/* no commands stashed for DROP */
 				commandCollected = true;
+				break;
+
+			case T_DropDatabaseLinkStmt:
+				address = DropDatabaseLink((DropDatabaseLinkStmt *) parsetree);
 				break;
 
 			case T_ImportForeignSchemaStmt:
@@ -2836,6 +2846,10 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_SEQUENCE;
 			break;
 
+		case T_CreateDatabaseLinkStmt:
+			tag = CMDTAG_CREATE_DATABASE_LINK;
+			break;
+
 		case T_AlterSeqStmt:
 			tag = CMDTAG_ALTER_SEQUENCE;
 			break;
@@ -2856,6 +2870,10 @@ CreateCommandTag(Node *parsetree)
 
 		case T_DropdbStmt:
 			tag = CMDTAG_DROP_DATABASE;
+			break;
+
+		case T_DropDatabaseLinkStmt:
+			tag = CMDTAG_DROP_DATABASE_LINK;
 			break;
 
 		case T_NotifyStmt:
@@ -3317,6 +3335,10 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_DDL;
 			break;
 
+		case T_CreateDatabaseLinkStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
 		case T_CreateStmt:
 		case T_CreateForeignTableStmt:
 			lev = LOGSTMT_DDL;
@@ -3503,6 +3525,10 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_DropdbStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
+		case T_DropDatabaseLinkStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

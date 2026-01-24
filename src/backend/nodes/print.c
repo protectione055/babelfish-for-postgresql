@@ -268,6 +268,10 @@ print_rt(const List *rtable)
 				printf("%d\t%s\t%u\t%c",
 					   i, rte->eref->aliasname, rte->relid, rte->relkind);
 				break;
+				case RTE_DBLINK:
+					printf("%d\t%s\t[dblink]",
+						   i, rte->eref->aliasname);
+					break;
 			case RTE_SUBQUERY:
 				printf("%d\t%s\t[subquery]",
 					   i, rte->eref->aliasname);

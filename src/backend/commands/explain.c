@@ -4056,12 +4056,32 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 		case T_ForeignScan:
 		case T_CustomScan:
 		case T_ModifyTable:
-			/* Assert it's on a real relation */
-			Assert(rte->rtekind == RTE_RELATION);
-			objectname = get_rel_name(rte->relid);
-			if (es->verbose)
-				namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
-			objecttag = "Relation Name";
+            /* Assert it's on a real relation */
+            if (rte->rtekind == RTE_DBLINK)
+            {
+                char *qrel;
+
+                if (rte->dblinknamespace)
+                    qrel = quote_qualified_identifier(rte->dblinknamespace,
+                                                    rte->dblinkrelname);
+                else
+                    qrel = quote_identifier(rte->dblinkrelname);
+
+                objectname = psprintf("%s@%s",
+                                      qrel,
+                                      quote_identifier(rte->dblinkname));
+                /* No local namespace for @dblink references */
+                namespace = NULL;
+                objecttag = "Relation Name";
+            }
+            else
+            {
+                Assert(rte->rtekind == RTE_RELATION);
+                objectname = get_rel_name(rte->relid);
+                if (es->verbose)
+                    namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
+                objecttag = "Relation Name";
+            }
 			break;
 		case T_FunctionScan:
 			{

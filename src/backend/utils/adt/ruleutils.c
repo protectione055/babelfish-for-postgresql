@@ -4329,10 +4329,10 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 	 * real_colnames[] will be indexed by physical column number, with NULL
 	 * entries for dropped columns.
 	 */
-	if (rte->rtekind == RTE_RELATION)
+	if (rte->rtekind == RTE_RELATION && !rte->dblinkname)
 	{
 		/* Relation --- look to the system catalogs for up-to-date info */
-		Relation	rel;
+		Relation		rel;
 		TupleDesc	tupdesc;
 
 		rel = relation_open(rte->relid, AccessShareLock);
@@ -12063,6 +12063,20 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 								 generate_relation_name(rte->relid,
 														context->namespaces));
 				break;
+			case RTE_DBLINK:
+				/* @dblink relation reference */
+				if (rte->dblinknamespace && rte->dblinknamespace[0] != '\0')
+					appendStringInfo(buf, "%s%s.%s@%s",
+								 only_marker(rte),
+								 quote_identifier(rte->dblinknamespace),
+								 quote_identifier(rte->dblinkrelname),
+								 quote_identifier(rte->dblinkname));
+				else
+					appendStringInfo(buf, "%s%s@%s",
+								 only_marker(rte),
+								 quote_identifier(rte->dblinkrelname),
+								 quote_identifier(rte->dblinkname));
+				break;
 			case RTE_SUBQUERY:
 				/* Subquery RTE */
 				appendStringInfoChar(buf, '(');
@@ -12355,6 +12369,15 @@ get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
 		 * conflict).
 		 */
 		if (strcmp(refname, get_relation_name(rte->relid)) != 0)
+			printalias = true;
+	}
+	else if (rte->rtekind == RTE_DBLINK)
+	{
+		/*
+		 * No local relid; compare against parser-assigned name to detect
+		 * conflict resolution by set_rtable_names.
+		 */
+		if (strcmp(refname, rte->eref->aliasname) != 0)
 			printalias = true;
 	}
 	else if (rte->rtekind == RTE_FUNCTION)

@@ -422,11 +422,21 @@ _readRangeTblEntry(void)
 		case RTE_RESULT:
 			/* no extra fields */
 			break;
+		case RTE_DBLINK:
+			READ_NODE_FIELD(coltypes);
+			READ_NODE_FIELD(coltypmods);
+			READ_NODE_FIELD(colcollations);
+			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d",
 				 (int) local_node->rtekind);
 			break;
 	}
+
+		READ_STRING_FIELD(dblinkname);
+		READ_STRING_FIELD(dblinknamespace);
+		READ_STRING_FIELD(dblinkrelname);
+		READ_UINT64_FIELD(dblink_signature);
 
 	READ_BOOL_FIELD(lateral);
 	READ_BOOL_FIELD(inFromCl);

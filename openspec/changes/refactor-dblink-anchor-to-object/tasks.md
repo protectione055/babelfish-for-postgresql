@@ -1,0 +1,15 @@
+## 1. Implementation
+- [x] 1.1 Introduce `RTE_DBLINK` in `RTEKind` and update `RangeTblEntry` to store DBLINK remote identifiers without overloading `RTE_RELATION`.
+- [x] 1.2 Update parser handling of `object@dblink` to construct `RTE_DBLINK` (no anchor relation open/lock) and to populate tupledesc/coltype lists from remote metadata.
+- [x] 1.3 Update system catalog and DDL:
+  - Remove `pg_dblink.dblrelid` from the `pg_dblink` catalog definition.
+  - Update `CREATE/DROP DATABASE LINK` to stop creating/dropping per-link anchor foreign tables.
+- [x] 1.4 Update planner catalog/rel-information paths to refresh remote schema metadata for `RTE_DBLINK` and to build foreign-access paths without assuming a `pg_class` relation.
+- [x] 1.5 Update executor foreign-scan initialization to derive scan tuple descriptors for `RTE_DBLINK` from cached remote metadata.
+- [x] 1.6 Update deparser (`pg_get_viewdef`, ruleutils) and related utilities to preserve `object@dblink` presentation and avoid exposing legacy anchor relation names.
+- [x] 1.7 Audit and update other core modules that currently key off `rte->dblinkname` on `RTE_RELATION` (e.g., rowmarks, permission checks, `expandRTE`, walkers).
+- [x] 1.8 Add/adjust regression and/or TAP tests to cover:
+  - `CREATE/DROP DATABASE LINK` no longer creates anchor relations
+  - `EXPLAIN` / `pg_get_viewdef` for queries/views referencing `@dblink` does not mention anchors
+  - View persistence and remote schema refresh still work
+- [x] 1.9 Run validation: `openspec validate refactor-dblink-anchor-to-object --strict --no-interactive`

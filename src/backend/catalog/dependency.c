@@ -36,6 +36,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
@@ -2188,6 +2189,21 @@ find_expr_references_walker(Node *node,
 					add_object_address(RelationRelationId, rte->relid, 0,
 									   context->addrs);
 					break;
+					case RTE_DBLINK:
+						{
+							Oid		dblinkid;
+
+							if (rte->dblinkname == NULL)
+								break;
+
+							dblinkid = GetSysCacheOid1(DBLINKNAME,
+												 Anum_pg_dblink_oid,
+												 CStringGetDatum(rte->dblinkname));
+							if (OidIsValid(dblinkid))
+								add_object_address(DbLinkRelationId, dblinkid, 0,
+												   context->addrs);
+						}
+						break;
 				case RTE_JOIN:
 
 					/*

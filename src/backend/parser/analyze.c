@@ -3483,6 +3483,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 				continue;
 			switch (rte->rtekind)
 			{
+				case RTE_DBLINK:
 				case RTE_RELATION:
 					{
 						RTEPermissionInfo *perminfo;
@@ -3572,6 +3573,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 				{
 					switch (rte->rtekind)
 					{
+						case RTE_DBLINK:
 						case RTE_RELATION:
 							{
 								RTEPermissionInfo *perminfo;
