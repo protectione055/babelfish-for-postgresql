@@ -8591,6 +8591,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 		case T_WindowFunc:
 		case T_MergeSupportFunc:
 		case T_FuncExpr:
+		case T_DblinkFuncExpr:
 		case T_JsonConstructorExpr:
 		case T_JsonExpr:
 			/* function-like: name(..) or name[..] */
@@ -9083,6 +9084,33 @@ get_rule_expr(Node *node, deparse_context *context,
 
 		case T_FuncExpr:
 			get_func_expr((FuncExpr *) node, context, showimplicit);
+			break;
+
+		case T_DblinkFuncExpr:
+			{
+				DblinkFuncExpr *df = (DblinkFuncExpr *) node;
+				int			nameparts = list_length(df->funcname);
+
+				if (nameparts == 1)
+				{
+					appendStringInfoString(buf,
+										quote_identifier(strVal(linitial(df->funcname))));
+				}
+				else if (nameparts == 2)
+				{
+					appendStringInfo(buf, "%s.%s",
+								 quote_identifier(strVal(linitial(df->funcname))),
+								 quote_identifier(strVal(lsecond(df->funcname))));
+				}
+				else
+				{
+					elog(ERROR, "unexpected remote routine name length: %d", nameparts);
+				}
+
+				appendStringInfo(buf, "@%s(", quote_identifier(df->dblinkname));
+				get_rule_expr((Node *) df->args, context, showimplicit);
+				appendStringInfoChar(buf, ')');
+			}
 			break;
 
 		case T_NamedArgExpr:

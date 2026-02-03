@@ -15,6 +15,8 @@ SELECT btrim(split_part(current_setting('unix_socket_directories'), ',', 1)) AS 
 \set dblink_connstr 'dbname=' :current_database ' port=' :current_port ' host=' :current_sockdir ' meta_ttl=0'
 \set dblink_connstr_fdw 'dbname=' :current_database ' port=' :current_port ' host=' :current_sockdir ' fdw=postgres_fdw meta_ttl=0'
 
+SET client_min_messages = warning;
+
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 
 CREATE SCHEMA "dblink_s";

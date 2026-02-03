@@ -24,6 +24,7 @@ struct ExprEvalStep;
 struct SubscriptingRefState;
 struct ScalarArrayOpExprHashTable;
 struct JsonConstructorExprState;
+struct FdwRoutine;
 
 /* Bits in ExprState->flags (see also execnodes.h for public flag bits): */
 /* expression's interpreter has been initialized */
@@ -121,6 +122,9 @@ typedef enum ExprEvalOp
 	EEOP_FUNCEXPR_STRICT,
 	EEOP_FUNCEXPR_FUSAGE,
 	EEOP_FUNCEXPR_STRICT_FUSAGE,
+
+	/* evaluate remote routine call via @dblink (DblinkFuncExpr) */
+	EEOP_DBLINK_FUNCEXPR,
 
 	/*
 	 * Evaluate boolean AND expression, one step per subexpression. FIRST/LAST
@@ -279,6 +283,27 @@ typedef enum ExprEvalOp
 	EEOP_LAST
 } ExprEvalOp;
 
+typedef struct DblinkRoutineExecState
+{
+	Oid			serverid;
+	Oid			userid;
+	const char *dblinkname;
+	const char *nspname; /* NULL means default/search-path semantics */
+	const char *proname;
+
+	uint64		expected_signature;
+	uint64		routine_signature;
+	const char *remote_sql;
+
+	int			nargs;
+	Oid		   *argtypes;
+	int32	   *argtypmods;
+	Datum	   *argvalues;
+	bool	   *argnulls;
+
+	const struct FdwRoutine *fdwroutine;
+} DblinkRoutineExecState;
+
 
 typedef struct ExprEvalStep
 {
@@ -367,6 +392,12 @@ typedef struct ExprEvalStep
 			int			nargs;	/* number of arguments */
 			bool		make_ro;	/* make arg0 R/O (used only for NULLIF) */
 		}			func;
+
+		/* for EEOP_DBLINK_FUNCEXPR */
+		struct
+		{
+			DblinkRoutineExecState *state;
+		} 			dblink_func;
 
 		/* for EEOP_BOOL_*_STEP */
 		struct

@@ -774,6 +774,38 @@ typedef struct FuncExpr
 } FuncExpr;
 
 /*
+ * DblinkFuncExpr - expression node for an Oracle-style remote function call
+ *
+ * This represents SQL surface syntax: schema.func@dblink(arglist...)
+ *
+ * Notes:
+ * - funcname and dblinkname are preserved for stable deparse/EXPLAIN output.
+ * - funcresulttype is resolved via the selected FDW during parse analysis.
+ * - routine_signature is an FDW-provided discriminator used for caching.
+ */
+typedef struct DblinkFuncExpr
+{
+	pg_node_attr(nodetag_number(478))
+	Expr		xpr;
+	/* function name, as a list of String */
+	List	   *funcname;
+	/* database link name (as written after '@') */
+	char	   *dblinkname;
+	/* arguments to the routine */
+	List	   *args;
+	/* PG_TYPE OID of result value */
+	Oid			funcresulttype pg_node_attr(query_jumble_ignore);
+	/* result typmod, if any */
+	int32		funcresulttypmod pg_node_attr(query_jumble_ignore);
+	/* OID of collation of result */
+	Oid			funccollid pg_node_attr(query_jumble_ignore);
+	/* FDW-provided remote routine signature */
+	uint64		routine_signature pg_node_attr(query_jumble_ignore);
+	/* token location, or -1 if unknown */
+	ParseLoc	location;
+} DblinkFuncExpr;
+
+/*
  * NamedArgExpr - a named argument of a function
  *
  * This node type can only appear in the args list of a FuncCall or FuncExpr

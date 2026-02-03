@@ -84,4 +84,28 @@ extern Oid	get_foreign_server_oid(const char *servername, bool missing_ok);
 
 extern TupleDesc GetCachedDblinkTableMetadata(Oid serverid, Oid userid, const char *nspname, const char *relname, uint64 *signature);
 
+/*
+ * Dblink routine metadata (resolved via FDW hook).
+ *
+ * remote_sql is FDW-defined and treated as an opaque execution template.
+ */
+typedef struct DblinkRoutineMetadata
+{
+	Oid			rettype;
+	int32		rettypmod;
+	Oid			retcollid;
+	uint64		routine_signature;
+	char	   *remote_sql;
+} DblinkRoutineMetadata;
+
+extern DblinkRoutineMetadata *GetCachedDblinkRoutineMetadata(Oid serverid,
+										Oid userid,
+										const char *dblinkname,
+										const char *nspname,
+										const char *proname,
+										int nargs,
+										const Oid *argtypes,
+										const int32 *argtypmods,
+										uint64 expected_signature);
+
 #endif							/* FOREIGN_H */

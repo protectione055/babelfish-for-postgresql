@@ -16,6 +16,7 @@
 #include "access/reloptions.h"
 #include "access/table.h"
 #include "access/tupdesc.h"
+#include "common/hashfn.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
@@ -27,6 +28,7 @@
 #include "miscadmin.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -984,5 +986,238 @@ GetCachedDblinkTableMetadata(Oid serverid, Oid userid, const char *nspname, cons
 	}
 
 	return tupdesc;
+}
+
+/*
+ * Dblink Routine Metadata Cache
+ */
+typedef struct DblinkRoutineCacheKey
+{
+	Oid			serverid;
+	Oid			userid;
+	char		dblinkname[NAMEDATALEN];
+	char		nspname[NAMEDATALEN];
+	char		proname[NAMEDATALEN];
+	uint64		argsig;
+} DblinkRoutineCacheKey;
+
+typedef struct DblinkRoutineCacheEntry
+{
+	DblinkRoutineCacheKey key;
+	Oid			rettype;
+	int32		rettypmod;
+	Oid			retcollid;
+	uint64		routine_signature;
+	char	   *remote_sql;
+	TimestampTz expires_at;
+} DblinkRoutineCacheEntry;
+
+static HTAB *DblinkRoutineCache = NULL;
+
+static void
+ValidateDblinkRoutineCache(void)
+{
+	HASHCTL		ctl;
+
+	/* Make sure we've initialized CacheMemoryContext. */
+	if (CacheMemoryContext == NULL)
+		CreateCacheMemoryContext();
+
+	if (DblinkRoutineCache)
+		return;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(DblinkRoutineCacheKey);
+	ctl.entrysize = sizeof(DblinkRoutineCacheEntry);
+	ctl.hcxt = CacheMemoryContext;
+
+	DblinkRoutineCache = hash_create("Dblink Routine Metadata Cache", 128, &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static int
+GetDblinkMetadataTTL(Oid serverid)
+{
+	ForeignServer *server;
+	HeapTuple	tup;
+	int			ttl_sec = 60;
+
+	server = GetForeignServer(serverid);
+	tup = SearchSysCache1(DBLINKNAME, CStringGetDatum(server->servername));
+	if (HeapTupleIsValid(tup))
+	{
+		Datum		options_datum;
+		bool		isnull;
+		Relation	dblinkrel = NULL;
+
+		/*
+		 * Don't rely on SysCacheGetAttr() here, since it uses the syscache's
+		 * cached tuple descriptor; if that gets out of sync, it can Assert.
+		 */
+		if (tup->t_tableOid == DbLinkRelationId)
+		{
+			dblinkrel = table_open(DbLinkRelationId, AccessShareLock);
+			options_datum = heap_getattr(tup,
+								Anum_pg_dblink_dbloptions,
+								RelationGetDescr(dblinkrel),
+								&isnull);
+			table_close(dblinkrel, AccessShareLock);
+		}
+		else
+		{
+			isnull = true;
+			options_datum = (Datum) 0;
+		}
+
+		if (!isnull)
+		{
+			List	   *options = untransformRelOptions(options_datum);
+			ListCell   *lc;
+
+			foreach(lc, options)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc);
+
+				if (strcmp(def->defname, "meta_ttl") == 0)
+				{
+					ttl_sec = atoi(strVal(def->arg));
+					break;
+				}
+			}
+		}
+		ReleaseSysCache(tup);
+	}
+
+	return ttl_sec;
+}
+
+/*
+ * GetCachedDblinkRoutineMetadata
+ *
+ * Cache key includes (serverid, userid, dblinkname, routine identity, arg sig).
+ * The FDW-provided routine_signature is stored in the cache entry, and if the
+ * caller provides a non-zero expected_signature, it must match.
+ */
+DblinkRoutineMetadata *
+GetCachedDblinkRoutineMetadata(Oid serverid,
+						Oid userid,
+						const char *dblinkname,
+						const char *nspname,
+						const char *proname,
+						int nargs,
+						const Oid *argtypes,
+						const int32 *argtypmods,
+						uint64 expected_signature)
+{
+	DblinkRoutineCacheKey key;
+	DblinkRoutineCacheEntry *entry;
+	bool		found;
+	TimestampTz now = GetCurrentTimestamp();
+	FdwRoutine *fdw;
+	int			ttl_sec;
+	uint64		argsig;
+	Oid			rettype = InvalidOid;
+	int32		rettypmod = -1;
+	Oid			retcollid = InvalidOid;
+	uint64		routine_signature = 0;
+	char	   *remote_sql = NULL;
+	DblinkRoutineMetadata *result;
+
+	/* Build arg signature hash */
+	{
+		uint64 seed = 0;
+		seed = hash_any_extended((const unsigned char *) &nargs, sizeof(nargs), seed);
+		if (nargs > 0)
+		{
+			seed = hash_any_extended((const unsigned char *) argtypes,
+									 sizeof(Oid) * nargs, seed);
+			seed = hash_any_extended((const unsigned char *) argtypmods,
+									 sizeof(int32) * nargs, seed);
+		}
+		argsig = seed;
+	}
+
+	MemSet(&key, 0, sizeof(key));
+	key.serverid = serverid;
+	key.userid = userid;
+	strlcpy(key.dblinkname, dblinkname, NAMEDATALEN);
+	if (nspname)
+		strlcpy(key.nspname, nspname, NAMEDATALEN);
+	strlcpy(key.proname, proname, NAMEDATALEN);
+	key.argsig = argsig;
+
+	ValidateDblinkRoutineCache();
+
+	entry = (DblinkRoutineCacheEntry *) hash_search(DblinkRoutineCache, &key,
+										HASH_FIND, &found);
+	if (found && entry->expires_at > now)
+	{
+		if (expected_signature == 0 || entry->routine_signature == expected_signature)
+		{
+			result = palloc0(sizeof(DblinkRoutineMetadata));
+			result->rettype = entry->rettype;
+			result->rettypmod = entry->rettypmod;
+			result->retcollid = entry->retcollid;
+			result->routine_signature = entry->routine_signature;
+			result->remote_sql = entry->remote_sql ? pstrdup(entry->remote_sql) : NULL;
+			return result;
+		}
+	}
+
+	/* Cache miss (or signature mismatch): resolve via FDW */
+	fdw = GetFdwRoutineByServerId(serverid);
+	if (fdw->GetDblinkRoutineMetadata == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("FDW does not support DBLINK remote routine invocation")));
+
+	if (!fdw->GetDblinkRoutineMetadata(serverid,
+									userid,
+									nspname,
+									proname,
+									nargs,
+									argtypes,
+									argtypmods,
+									&rettype,
+									&rettypmod,
+									&retcollid,
+									&routine_signature,
+									&remote_sql))
+		return NULL;
+
+	if (!OidIsValid(rettype))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("FDW did not provide a valid return type for remote routine invocation")));
+
+	ttl_sec = GetDblinkMetadataTTL(serverid);
+
+	{
+		bool		entry_found;
+		MemoryContext oldcxt;
+
+		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+		entry = (DblinkRoutineCacheEntry *) hash_search(DblinkRoutineCache, &key,
+										HASH_ENTER, &entry_found);
+		if (entry_found && entry->remote_sql)
+			pfree(entry->remote_sql);
+
+		entry->rettype = rettype;
+		entry->rettypmod = rettypmod;
+		entry->retcollid = retcollid;
+		entry->routine_signature = routine_signature;
+		entry->remote_sql = remote_sql ? pstrdup(remote_sql) : NULL;
+		entry->expires_at = TimestampTzPlusMilliseconds(now, ttl_sec * 1000L);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	result = palloc0(sizeof(DblinkRoutineMetadata));
+	result->rettype = rettype;
+	result->rettypmod = rettypmod;
+	result->retcollid = retcollid;
+	result->routine_signature = routine_signature;
+	result->remote_sql = remote_sql;
+
+	return result;
 }
 

@@ -414,6 +414,29 @@ static TupleDesc postgresGetDblinkTableMetadata(Oid serverOid,
 											 const char *remote_schema,
 											 const char *remote_table,
 											 uint64 *schema_signature);
+static bool postgresGetDblinkRoutineMetadata(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 int nargs,
+									 const Oid *argtypes,
+									 const int32 *argtypmods,
+									 Oid *rettype,
+									 int32 *rettypmod,
+									 Oid *retcollid,
+									 uint64 *routine_signature,
+									 char **remote_sql);
+static Datum postgresExecDblinkRoutine(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 uint64 routine_signature,
+									 const char *remote_sql,
+									 int nargs,
+									 const Oid *argtypes,
+									 const Datum *argvalues,
+									 const bool *argnulls,
+									 bool *isnull);
 static void postgresGetForeignJoinPaths(PlannerInfo *root,
 										RelOptInfo *joinrel,
 										RelOptInfo *outerrel,
@@ -609,6 +632,8 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 
 	/* Support functions for @dblink remote metadata */
 	routine->GetDblinkTableMetadata = postgresGetDblinkTableMetadata;
+	routine->GetDblinkRoutineMetadata = postgresGetDblinkRoutineMetadata;
+	routine->ExecDblinkRoutine = postgresExecDblinkRoutine;
 
 	/* Support functions for join push-down */
 	routine->GetForeignJoinPaths = postgresGetForeignJoinPaths;
@@ -5950,6 +5975,248 @@ postgresGetDblinkTableMetadata(Oid serverOid,
 
 	PQclear(res);
 	return tupdesc;
+}
+
+/*
+ * Resolve remote routine metadata for func@dblink(...) when using postgres_fdw.
+ *
+ * We let the remote PostgreSQL server perform overload resolution by
+ * preparing a parameterized SELECT expression, then inspecting the result
+ * column type and typmod from PQdescribePrepared.
+ */
+static bool
+postgresGetDblinkRoutineMetadata(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 int nargs,
+									 const Oid *argtypes,
+									 const int32 *argtypmods,
+									 Oid *rettype,
+									 int32 *rettypmod,
+									 Oid *retcollid,
+									 uint64 *routine_signature,
+									 char **remote_sql)
+{
+	ForeignServer *server;
+	UserMapping *mapping;
+	PGconn	   *conn;
+	StringInfoData sql;
+	char		stmtname[NAMEDATALEN];
+	PGresult   *res;
+	PGresult   *desc;
+	Oid			rt;
+	int32		rtm;
+	uint64		sig = 0;
+	const char *sqlstate;
+	int			i;
+	static uint32	stmt_counter = 0;
+	const char *nsp;
+
+	if (rettype)
+		*rettype = InvalidOid;
+	if (rettypmod)
+		*rettypmod = -1;
+	if (retcollid)
+		*retcollid = InvalidOid;
+	if (routine_signature)
+		*routine_signature = 0;
+	if (remote_sql)
+		*remote_sql = NULL;
+
+	if (remote_routine == NULL || remote_routine[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("remote routine name is required for database link metadata")));
+
+	/* Default schema to public to avoid relying on remote search_path. */
+	nsp = (remote_schema && remote_schema[0] != '\0') ? remote_schema : "public";
+
+	server = GetForeignServer(serverOid);
+	mapping = GetUserMapping(userid, server->serverid);
+	conn = GetConnection(mapping, false, NULL);
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT %s.%s(",
+				 quote_identifier(nsp),
+				 quote_identifier(remote_routine));
+	for (i = 0; i < nargs; i++)
+	{
+		if (i > 0)
+			appendStringInfoString(&sql, ", ");
+		appendStringInfo(&sql, "$%d", i + 1);
+	}
+	appendStringInfoChar(&sql, ')');
+
+	snprintf(stmtname, sizeof(stmtname), "dblink_routine_%u", ++stmt_counter);
+
+	res = PQprepare(conn, stmtname, sql.data, nargs, argtypes);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+		if (sqlstate && strcmp(sqlstate, "42725") == 0)
+		{
+			/* ambiguous_function */
+			PQclear(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+					 errmsg("ambiguous remote overload resolution for routine \"%s\"", remote_routine),
+					 errhint("Add an explicit cast to disambiguate the remote routine call.")));
+		}
+		if (sqlstate && strcmp(sqlstate, "42883") == 0)
+		{
+			/* undefined_function */
+			PQclear(res);
+			return false;
+		}
+
+		pgfdw_report_error(ERROR, res, conn, false, sql.data);
+	}
+	PQclear(res);
+
+	desc = PQdescribePrepared(conn, stmtname);
+	if (PQresultStatus(desc) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, desc, conn, false, sql.data);
+
+	if (PQnfields(desc) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("FDW returned unexpected column shape while resolving remote routine metadata")));
+
+	rt = PQftype(desc, 0);
+	rtm = PQfmod(desc, 0);
+	PQclear(desc);
+
+	if (!OidIsValid(rt))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("could not determine return type for remote routine \"%s\"", remote_routine)));
+
+	if (rettype)
+		*rettype = rt;
+	if (rettypmod)
+		*rettypmod = rtm;
+	if (retcollid)
+		*retcollid = get_typcollation(rt);
+
+	if (routine_signature)
+	{
+		sig = hash_any_extended((const unsigned char *) nsp, strlen(nsp), sig);
+		sig = hash_any_extended((const unsigned char *) remote_routine, strlen(remote_routine), sig);
+		sig = hash_any_extended((const unsigned char *) &nargs, sizeof(int), sig);
+		if (nargs > 0)
+		{
+			sig = hash_any_extended((const unsigned char *) argtypes, sizeof(Oid) * nargs, sig);
+			sig = hash_any_extended((const unsigned char *) argtypmods, sizeof(int32) * nargs, sig);
+		}
+		sig = hash_any_extended((const unsigned char *) &rt, sizeof(Oid), sig);
+		sig = hash_any_extended((const unsigned char *) &rtm, sizeof(int32), sig);
+		*routine_signature = sig;
+	}
+
+	if (remote_sql)
+		*remote_sql = pstrdup(sql.data);
+
+	return true;
+}
+
+/*
+ * Execute remote routine call for func@dblink(...) when using postgres_fdw.
+ */
+static Datum
+postgresExecDblinkRoutine(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 uint64 routine_signature,
+									 const char *remote_sql,
+									 int nargs,
+									 const Oid *argtypes,
+									 const Datum *argvalues,
+									 const bool *argnulls,
+									 bool *isnull)
+{
+	ForeignServer *server;
+	UserMapping *mapping;
+	PGconn	   *conn;
+	PGresult   *res;
+	const char **param_values;
+	FmgrInfo   *param_flinfo;
+	Oid			typefnoid;
+	bool		isvarlena;
+	int			nestlevel;
+	int			i;
+	Oid			rt;
+	int32		rtm;
+	Oid		typinput;
+	Oid		typioparam;
+	FmgrInfo	in_finfo;
+	Datum		result;
+	char	   *resval;
+
+	(void) remote_schema;
+	(void) remote_routine;
+	(void) routine_signature;
+
+	if (isnull)
+		*isnull = false;
+
+	if (remote_sql == NULL || remote_sql[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("FDW did not provide remote SQL for routine execution")));
+
+	server = GetForeignServer(serverOid);
+	mapping = GetUserMapping(userid, server->serverid);
+	conn = GetConnection(mapping, false, NULL);
+
+	param_values = (const char **) palloc0(sizeof(char *) * nargs);
+	param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * nargs);
+
+	for (i = 0; i < nargs; i++)
+	{
+		getTypeOutputInfo(argtypes[i], &typefnoid, &isvarlena);
+		fmgr_info(typefnoid, &param_flinfo[i]);
+	}
+
+	nestlevel = set_transmission_modes();
+	for (i = 0; i < nargs; i++)
+	{
+		if (argnulls[i])
+			param_values[i] = NULL;
+		else
+			param_values[i] = OutputFunctionCall(&param_flinfo[i], argvalues[i]);
+	}
+	reset_transmission_modes(nestlevel);
+
+	res = PQexecParams(conn, remote_sql, nargs, argtypes,
+					 param_values, NULL, NULL, 0);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(ERROR, res, conn, false, remote_sql);
+
+	if (PQnfields(res) != 1 || PQntuples(res) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("unexpected result shape from remote routine execution")));
+
+	if (PQgetisnull(res, 0, 0))
+	{
+		if (isnull)
+			*isnull = true;
+		PQclear(res);
+		return (Datum) 0;
+	}
+
+	rt = PQftype(res, 0);
+	rtm = PQfmod(res, 0);
+	resval = PQgetvalue(res, 0, 0);
+
+	getTypeInputInfo(rt, &typinput, &typioparam);
+	fmgr_info(typinput, &in_finfo);
+	result = InputFunctionCall(&in_finfo, resval, typioparam, rtm);
+
+	PQclear(res);
+	return result;
 }
 
 /*

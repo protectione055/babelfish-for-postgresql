@@ -17,9 +17,11 @@
 
 #include "catalog/namespace.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
+#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -42,6 +44,7 @@
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/xml.h"
 
@@ -58,6 +61,7 @@ static Node *transformAExprDistinct(ParseState *pstate, A_Expr *a);
 static Node *transformAExprNullIf(ParseState *pstate, A_Expr *a);
 static Node *transformAExprIn(ParseState *pstate, A_Expr *a);
 static Node *transformAExprBetween(ParseState *pstate, A_Expr *a);
+static Node *transformDblinkFuncExpr(ParseState *pstate, DblinkFuncExpr *df);
 static Node *transformMergeSupportFunc(ParseState *pstate, MergeSupportFunc *f);
 static Node *transformBoolExpr(ParseState *pstate, BoolExpr *a);
 static Node *transformFuncCall(ParseState *pstate, FuncCall *fn);
@@ -141,6 +145,125 @@ transformExpr(ParseState *pstate, Node *expr, ParseExprKind exprKind)
 	pstate->p_expr_kind = sv_expr_kind;
 
 	return result;
+}
+
+/*
+ * Transform an Oracle-style remote routine call expression: func@dblink(...)
+ *
+ * In the initial release we only allow this in SELECT targetlists.
+ */
+static Node *
+transformDblinkFuncExpr(ParseState *pstate, DblinkFuncExpr *df)
+{
+	List	   *targs = NIL;
+	ListCell   *lc;
+	HeapTuple	tup;
+	Oid			dblink_serverid = InvalidOid;
+	char	   *nspname = NULL;
+	char	   *proname = NULL;
+	int			nargs;
+	Oid		  *argtypes;
+	int32	  *argtypmods;
+	DblinkRoutineMetadata *meta;
+
+	/* Enforce initial scope restriction */
+	if (pstate->p_expr_kind != EXPR_KIND_SELECT_TARGET)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("remote routine invocation via @dblink is only supported in SELECT targetlists"),
+				 parser_errposition(pstate, df->location)));
+
+	/* Validate/normalize function name parts */
+	if (df->funcname == NIL || list_length(df->funcname) < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid remote routine name"),
+				 parser_errposition(pstate, df->location)));
+	if (list_length(df->funcname) == 1)
+	{
+		proname = strVal(linitial(df->funcname));
+	}
+	else if (list_length(df->funcname) == 2)
+	{
+		nspname = strVal(linitial(df->funcname));
+		proname = strVal(lsecond(df->funcname));
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("database-qualified names are not supported with @dblink"),
+				 parser_errposition(pstate, df->location)));
+	}
+
+	/* Transform arguments */
+	foreach(lc, df->args)
+	{
+		Node   *arg = (Node *) lfirst(lc);
+		Node   *targ;
+
+		if (IsA(arg, NamedArgExpr))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("named arguments are not supported for remote routine calls"),
+					 parser_errposition(pstate, ((NamedArgExpr *) arg)->location)));
+
+		targ = transformExprRecurse(pstate, arg);
+		targs = lappend(targs, targ);
+	}
+	df->args = targs;
+
+	/* Resolve database link -> foreign server */
+	tup = SearchSysCache1(DBLINKNAME, CStringGetDatum(df->dblinkname));
+	if (!HeapTupleIsValid(tup))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database link \"%s\" does not exist", df->dblinkname),
+				 parser_errposition(pstate, df->location)));
+
+	dblink_serverid = DatumGetObjectId(
+		SysCacheGetAttrNotNull(DBLINKNAME, tup, Anum_pg_dblink_dblserver));
+	ReleaseSysCache(tup);
+
+	nargs = list_length(df->args);
+	argtypes = palloc(sizeof(Oid) * nargs);
+	argtypmods = palloc(sizeof(int32) * nargs);
+
+	{
+		int		argno = 0;
+		foreach(lc, df->args)
+		{
+			Node *arg = (Node *) lfirst(lc);
+
+			argtypes[argno] = exprType(arg);
+			argtypmods[argno] = exprTypmod(arg);
+			argno++;
+		}
+	}
+
+	meta = GetCachedDblinkRoutineMetadata(dblink_serverid,
+								 GetUserId(),
+								 df->dblinkname,
+								 nspname,
+								 proname,
+								 nargs,
+								 argtypes,
+								 argtypmods,
+								 df->routine_signature);
+	if (meta == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("could not resolve remote routine \"%s\" for database link \"%s\"",
+						proname, df->dblinkname),
+				 parser_errposition(pstate, df->location)));
+
+	/* Fill in analyzed typing/signature fields */
+	df->funcresulttype = meta->rettype;
+	df->funcresulttypmod = meta->rettypmod;
+	df->funccollid = meta->retcollid;
+	df->routine_signature = meta->routine_signature;
+
+	return (Node *) df;
 }
 
 static Node *
@@ -236,6 +359,10 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 
 		case T_FuncCall:
 			result = transformFuncCall(pstate, (FuncCall *) expr);
+			break;
+
+		case T_DblinkFuncExpr:
+			result = transformDblinkFuncExpr(pstate, (DblinkFuncExpr *) expr);
 			break;
 
 		case T_MultiAssignRef:

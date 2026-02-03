@@ -707,6 +707,7 @@ fix_domain_typmods_hook_type fix_domain_typmods_hook = NULL;
  * parse errors.  It is needed by PL/pgSQL.
  */
 %token <str>	IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op
+%token			DBLINK_OP
 %token <ival>	ICONST PARAM
 %token			TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER
 %token			LESS_EQUALS GREATER_EQUALS NOT_EQUALS
@@ -15762,6 +15763,21 @@ func_application: func_name '(' ')'
 											   COERCE_EXPLICIT_CALL,
 											   @1);
 				}
+			| func_name DBLINK_OP name '(' ')'
+				{
+					DblinkFuncExpr *n;
+
+					n = makeNode(DblinkFuncExpr);
+					n->funcname = $1;
+					n->dblinkname = $3;
+					n->args = NIL;
+					n->funcresulttype = InvalidOid;
+					n->funcresulttypmod = -1;
+					n->funccollid = InvalidOid;
+					n->routine_signature = 0;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
 			| func_name '(' func_arg_list opt_sort_clause ')'
 				{
 					FuncCall   *n = makeFuncCall($1, $3,
@@ -15769,6 +15785,21 @@ func_application: func_name '(' ')'
 												 @1);
 
 					n->agg_order = $4;
+					$$ = (Node *) n;
+				}
+			| func_name DBLINK_OP name '(' func_arg_list ')'
+				{
+					DblinkFuncExpr *n;
+
+					n = makeNode(DblinkFuncExpr);
+					n->funcname = $1;
+					n->dblinkname = $3;
+					n->args = $5;
+					n->funcresulttype = InvalidOid;
+					n->funcresulttypmod = -1;
+					n->funccollid = InvalidOid;
+					n->routine_signature = 0;
+					n->location = @1;
 					$$ = (Node *) n;
 				}
 			| func_name '(' VARIADIC func_arg_expr opt_sort_clause ')'
@@ -18023,7 +18054,6 @@ unreserved_keyword:
 			| LAST_P
 			| LEAKPROOF
 			| LEVEL
-			| LINK_P
 			| LISTEN
 			| LOAD
 			| LOCAL
@@ -18375,6 +18405,7 @@ reserved_keyword:
 			| LATERAL_P
 			| LEADING
 			| LIMIT
+            | LINK_P
 			| LOCALTIME
 			| LOCALTIMESTAMP
 			| NOT

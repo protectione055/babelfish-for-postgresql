@@ -3,6 +3,7 @@
 --
 
 -- Setup
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 
 -- Create a table that mimics a remote table

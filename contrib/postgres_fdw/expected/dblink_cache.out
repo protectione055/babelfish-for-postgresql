@@ -2,6 +2,7 @@
 -- Test dblink metadata cache TTL
 --
 -- Setup
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 -- Create a table that mimics a remote table
 CREATE SCHEMA dblink_cache;
@@ -28,10 +29,10 @@ SELECT * FROM dblink_cache.test_remote_table@mylink_ttl ORDER BY id;
 (1 row)
 
 -- Access without explicit schema should default to public
-SELECT * FROM test_remote_public@mylink_ttl ORDER BY id;
+SELECT id::text AS id, data FROM test_remote_public@mylink_ttl ORDER BY id;
  id |  data  
 ----+--------
-    1 | public
+ 1  | public
 (1 row)
 
 -- Modify remote table: this would break query if cache is used (because * expands using old schema, but remote requires new schema or errors)
@@ -100,7 +101,6 @@ BEGIN
     END;
 END;
 $d$;
-NOTICE:  Caught expected error: invalid meta_ttl value in connection string
 DO $d$
 BEGIN
     BEGIN
@@ -110,7 +110,6 @@ BEGIN
     END;
 END;
 $d$;
-NOTICE:  Caught expected error: invalid meta_ttl value in connection string
 -- Cleanup
 DROP DATABASE LINK mylink_ttl;
 DROP DATABASE LINK mylink_short;

@@ -167,6 +167,31 @@ typedef TupleDesc (*GetDblinkTableMetadata_function) (Oid serverOid,
 										   const char *remote_table,
 										   uint64 *schema_signature);
 
+typedef bool (*GetDblinkRoutineMetadata_function) (Oid serverOid,
+										Oid userid,
+										const char *remote_schema,
+										const char *remote_routine,
+										int nargs,
+										const Oid *argtypes,
+										const int32 *argtypmods,
+										Oid *rettype,
+										int32 *rettypmod,
+										Oid *retcollid,
+										uint64 *routine_signature,
+										char **remote_sql);
+
+typedef Datum (*ExecDblinkRoutine_function) (Oid serverOid,
+									Oid userid,
+									const char *remote_schema,
+									const char *remote_routine,
+									uint64 routine_signature,
+									const char *remote_sql,
+									int nargs,
+									const Oid *argtypes,
+									const Datum *argvalues,
+									const bool *argnulls,
+									bool *isnull);
+
 typedef void (*ExecForeignTruncate_function) (List *rels,
 											  DropBehavior behavior,
 											  bool restart_seqs);
@@ -268,6 +293,8 @@ typedef struct FdwRoutine
 
 	/* Support functions for @dblink remote metadata */
 	GetDblinkTableMetadata_function GetDblinkTableMetadata;
+	GetDblinkRoutineMetadata_function GetDblinkRoutineMetadata;
+	ExecDblinkRoutine_function ExecDblinkRoutine;
 
 	/* Support functions for TRUNCATE */
 	ExecForeignTruncate_function ExecForeignTruncate;
