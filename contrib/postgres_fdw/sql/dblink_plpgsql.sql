@@ -1,0 +1,71 @@
+-- ===================================================================
+-- tests for table@dblink usage inside functions/procedures (plpgsql)
+-- ===================================================================
+
+SELECT current_database() AS current_database,
+  current_setting('port') AS current_port
+\gset
+
+SELECT btrim(split_part(current_setting('unix_socket_directories'), ',', 1)) AS current_sockdir
+\gset
+
+\set dblink_connstr_fdw 'dbname=' :current_database ' port=' :current_port ' host=' :current_sockdir ' fdw=postgres_fdw meta_ttl=0'
+
+SET client_min_messages = warning;
+
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+
+CREATE SCHEMA dblink_plpgsql;
+CREATE TABLE dblink_plpgsql.t1 (c1 int PRIMARY KEY);
+INSERT INTO dblink_plpgsql.t1 SELECT generate_series(1, 10);
+ANALYZE dblink_plpgsql.t1;
+
+CREATE DATABASE LINK dblink_plpgsql_link CONNECT TO CURRENT_USER
+	USING :'dblink_connstr_fdw';
+
+-- -------------------------------------------------------------------
+-- Function: SQL-language routine referencing table@dblink
+-- -------------------------------------------------------------------
+CREATE FUNCTION dblink_plpgsql.f_count() RETURNS int
+LANGUAGE SQL
+AS $$
+	SELECT count(*)::int FROM dblink_plpgsql.t1@dblink_plpgsql_link;
+$$;
+
+SELECT dblink_plpgsql.f_count();
+
+-- -------------------------------------------------------------------
+-- Function: parameterized WHERE clause on table@dblink
+-- -------------------------------------------------------------------
+CREATE FUNCTION dblink_plpgsql.f_lookup(p int) RETURNS int
+LANGUAGE SQL
+AS $$
+	SELECT c1 FROM dblink_plpgsql.t1@dblink_plpgsql_link WHERE c1 = $1;
+$$;
+
+SELECT dblink_plpgsql.f_lookup(7);
+
+-- -------------------------------------------------------------------
+-- Procedure: simple remote table access with side effects
+-- -------------------------------------------------------------------
+CREATE TABLE dblink_plpgsql.proc_log(v int);
+
+CREATE PROCEDURE dblink_plpgsql.p_log_max()
+LANGUAGE SQL
+AS $$
+	INSERT INTO dblink_plpgsql.proc_log
+	SELECT max(c1) FROM dblink_plpgsql.t1@dblink_plpgsql_link;
+$$;
+
+CALL dblink_plpgsql.p_log_max();
+SELECT * FROM dblink_plpgsql.proc_log;
+
+-- Cleanup
+DROP PROCEDURE dblink_plpgsql.p_log_max();
+DROP TABLE dblink_plpgsql.proc_log;
+
+DROP FUNCTION dblink_plpgsql.f_lookup(int);
+DROP FUNCTION dblink_plpgsql.f_count();
+
+DROP DATABASE LINK dblink_plpgsql_link;
+DROP SCHEMA dblink_plpgsql CASCADE;
