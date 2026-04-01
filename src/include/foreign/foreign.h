@@ -79,7 +79,33 @@ extern ForeignTable *GetForeignTable(Oid relid);
 
 extern List *GetForeignColumnOptions(Oid relid, AttrNumber attnum);
 
+extern Oid	get_dblink_oid(const char *dblinkname, bool missing_ok);
+extern Oid	get_dblink_server_oid(const char *dblinkname, bool missing_ok);
 extern Oid	get_foreign_data_wrapper_oid(const char *fdwname, bool missing_ok);
 extern Oid	get_foreign_server_oid(const char *servername, bool missing_ok);
+
+extern TupleDesc GetCachedDblinkTableMetadata(Oid serverid, Oid userid, const char *nspname, const char *relname);
+
+/*
+ * Dblink routine metadata (resolved via FDW hook).
+ *
+ * remote_sql is FDW-defined and treated as an opaque execution template.
+ */
+typedef struct DblinkRoutineMetadata
+{
+	Oid			rettype;
+	int32		rettypmod;
+	Oid			retcollid;
+	char	   *remote_sql;
+} DblinkRoutineMetadata;
+
+extern DblinkRoutineMetadata *GetCachedDblinkRoutineMetadata(Oid serverid,
+										Oid userid,
+										const char *dblinkname,
+										const char *nspname,
+										const char *proname,
+										int nargs,
+										const Oid *argtypes,
+										const int32 *argtypmods);
 
 #endif							/* FOREIGN_H */

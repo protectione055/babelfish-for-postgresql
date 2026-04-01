@@ -72,6 +72,9 @@ typedef struct RangeVar
 {
 	NodeTag		type;
 
+	/* the server name, or NULL */
+	char	   *servername;
+
 	/* the catalog (database) name, or NULL */
 	char	   *catalogname;
 
@@ -772,6 +775,34 @@ typedef struct FuncExpr
 	Oid			parentOwnerId pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
 	int			insideView pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
 } FuncExpr;
+
+/*
+ * DblinkFuncExpr - expression node for an Oracle-style remote function call
+ *
+ * This represents SQL surface syntax: schema.func@dblink(arglist...)
+ *
+ * Notes:
+ * - funcname and dblinkname are preserved for stable deparse/EXPLAIN output.
+ * - funcresulttype is resolved via the selected FDW during parse analysis.
+ */
+typedef struct DblinkFuncExpr
+{
+	Expr		xpr;
+	/* function name, as a list of String */
+	List	   *funcname;
+	/* database link name (as written after '@') */
+	char	   *dblinkname;
+	/* arguments to the routine */
+	List	   *args;
+	/* PG_TYPE OID of result value */
+	Oid			funcresulttype pg_node_attr(query_jumble_ignore);
+	/* result typmod, if any */
+	int32		funcresulttypmod pg_node_attr(query_jumble_ignore);
+	/* OID of collation of result */
+	Oid			funccollid pg_node_attr(query_jumble_ignore);
+	/* token location, or -1 if unknown */
+	ParseLoc	location;
+} DblinkFuncExpr;
 
 /*
  * NamedArgExpr - a named argument of a function

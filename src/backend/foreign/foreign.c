@@ -14,19 +14,26 @@
 
 #include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "access/table.h"
+#include "access/tupdesc.h"
+#include "common/hashfn.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
+#include "catalog/pg_dblink.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/varlena.h"
 
 
@@ -715,6 +722,47 @@ get_foreign_server_oid(const char *servername, bool missing_ok)
 }
 
 /*
+ * get_dblink_oid - given a dblink name, look up the OID
+ */
+Oid
+get_dblink_oid(const char *dblinkname, bool missing_ok)
+{
+	Oid			oid;
+
+	oid = GetSysCacheOid1(DBLINKNAME, Anum_pg_dblink_oid,
+						  CStringGetDatum(dblinkname));
+	if (!OidIsValid(oid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database link \"%s\" does not exist", dblinkname)));
+	return oid;
+}
+
+/*
+ * get_dblink_server_oid - given a dblink name, look up the foreign server OID
+ */
+Oid
+get_dblink_server_oid(const char *dblinkname, bool missing_ok)
+{
+	Oid			dblinkid;
+	HeapTuple	tup;
+	Oid			serverid;
+
+	dblinkid = get_dblink_oid(dblinkname, missing_ok);
+	if (!OidIsValid(dblinkid))
+		return InvalidOid;
+
+	tup = SearchSysCache1(DBLINKOID, ObjectIdGetDatum(dblinkid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database link %u", dblinkid);
+
+	serverid = ((Form_pg_dblink) GETSTRUCT(tup))->dblserver;
+	ReleaseSysCache(tup);
+
+	return serverid;
+}
+
+/*
  * Get a copy of an existing local path for a given join relation.
  *
  * This function is usually helpful to obtain an alternate local path for EPQ
@@ -824,3 +872,383 @@ GetExistingLocalJoinPath(RelOptInfo *joinrel)
 	}
 	return NULL;
 }
+
+/*
+ * Dblink Metadata Cache
+ */
+typedef struct DblinkMetaCacheKey
+{
+	Oid			serverid;
+	Oid			userid;
+	char		nspname[NAMEDATALEN];
+	char		relname[NAMEDATALEN];
+} DblinkMetaCacheKey;
+
+typedef struct DblinkMetaCacheEntry
+{
+	DblinkMetaCacheKey key;
+	TupleDesc	tupdesc;
+	TimestampTz expires_at;
+} DblinkMetaCacheEntry;
+
+static HTAB *DblinkMetaCache = NULL;
+
+static void
+ValidateDblinkMetaCache(void)
+{
+	HASHCTL		ctl;
+
+	/* Make sure we've initialized CacheMemoryContext. */
+	if (CacheMemoryContext == NULL)
+		CreateCacheMemoryContext();
+
+	if (DblinkMetaCache)
+		return;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(DblinkMetaCacheKey);
+	ctl.entrysize = sizeof(DblinkMetaCacheEntry);
+	ctl.hcxt = CacheMemoryContext;
+
+	DblinkMetaCache = hash_create("Dblink Metadata Cache", 128, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+TupleDesc
+GetCachedDblinkTableMetadata(Oid serverid, Oid userid, const char *nspname, const char *relname)
+{
+	DblinkMetaCacheKey key;
+	DblinkMetaCacheEntry *entry;
+	bool		found;
+	TimestampTz now = GetCurrentTimestamp();
+	TupleDesc	tupdesc = NULL;
+	FdwRoutine *fdw;
+	int			ttl_sec = 60;	/* Default */
+
+	MemSet(&key, 0, sizeof(key));
+	key.serverid = serverid;
+	key.userid = userid;
+	if (nspname)
+		strlcpy(key.nspname, nspname, NAMEDATALEN);
+	strlcpy(key.relname, relname, NAMEDATALEN);
+
+	ValidateDblinkMetaCache();
+
+	entry = (DblinkMetaCacheEntry *) hash_search(DblinkMetaCache, &key, HASH_FIND, &found);
+
+	if (found)
+	{
+		if (entry->expires_at > now)
+			return CreateTupleDescCopy(entry->tupdesc);
+	}
+
+	/* Retrieve TTL from pg_dblink */
+	{
+		ForeignServer *server = GetForeignServer(serverid);
+		Oid			dblinkid;
+		HeapTuple	tup;
+
+		dblinkid = get_dblink_oid(server->servername, true);
+		tup = OidIsValid(dblinkid) ?
+			SearchSysCache1(DBLINKOID, ObjectIdGetDatum(dblinkid)) : NULL;
+		if (HeapTupleIsValid(tup))
+		{
+			Datum		options_datum;
+			bool		isnull;
+			Relation	dblinkrel = NULL;
+
+			/*
+			 * Don't rely on SysCacheGetAttr() here, since it uses the syscache's
+			 * cached tuple descriptor; if that gets out of sync, it can Assert.
+			 */
+			if (tup->t_tableOid == DbLinkRelationId)
+			{
+				dblinkrel = table_open(DbLinkRelationId, AccessShareLock);
+				options_datum = heap_getattr(tup,
+									Anum_pg_dblink_dbloptions,
+									RelationGetDescr(dblinkrel),
+									&isnull);
+				table_close(dblinkrel, AccessShareLock);
+			}
+			else
+			{
+				isnull = true;
+				options_datum = (Datum) 0;
+			}
+			if (!isnull)
+			{
+				List	   *options = untransformRelOptions(options_datum);
+				ListCell   *lc;
+
+				foreach(lc, options)
+				{
+					DefElem    *def = (DefElem *) lfirst(lc);
+
+					if (strcmp(def->defname, "meta_ttl") == 0)
+					{
+						ttl_sec = atoi(strVal(def->arg));
+						break;
+					}
+				}
+			}
+			ReleaseSysCache(tup);
+		}
+	}
+
+	fdw = GetFdwRoutineByServerId(serverid);
+	if (fdw->GetDblinkTableMetadata == NULL)
+		ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			errmsg("FDW does not support database link metadata")));
+
+	tupdesc = fdw->GetDblinkTableMetadata(serverid, userid, nspname, relname);
+
+	if (tupdesc)
+	{
+		bool		entry_found;
+		MemoryContext oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+		TupleDesc	cached_desc = CreateTupleDescCopy(tupdesc);
+
+		MemoryContextSwitchTo(oldcxt);
+
+		entry = (DblinkMetaCacheEntry *) hash_search(DblinkMetaCache, &key, HASH_ENTER, &entry_found);
+		if (entry_found && entry->tupdesc)
+			FreeTupleDesc(entry->tupdesc);
+
+		entry->tupdesc = cached_desc;
+		entry->expires_at = TimestampTzPlusMilliseconds(now, ttl_sec * 1000L);
+	}
+	else
+	{
+		if (found)
+			hash_search(DblinkMetaCache, &key, HASH_REMOVE, NULL);
+	}
+
+	return tupdesc;
+}
+
+/*
+ * Dblink Routine Metadata Cache
+ */
+typedef struct DblinkRoutineCacheKey
+{
+	Oid			serverid;
+	Oid			userid;
+	char		dblinkname[NAMEDATALEN];
+	char		nspname[NAMEDATALEN];
+	char		proname[NAMEDATALEN];
+	uint64		argsig;
+} DblinkRoutineCacheKey;
+
+typedef struct DblinkRoutineCacheEntry
+{
+	DblinkRoutineCacheKey key;
+	Oid			rettype;
+	int32		rettypmod;
+	Oid			retcollid;
+	char	   *remote_sql;
+	TimestampTz expires_at;
+} DblinkRoutineCacheEntry;
+
+static HTAB *DblinkRoutineCache = NULL;
+
+static void
+ValidateDblinkRoutineCache(void)
+{
+	HASHCTL		ctl;
+
+	/* Make sure we've initialized CacheMemoryContext. */
+	if (CacheMemoryContext == NULL)
+		CreateCacheMemoryContext();
+
+	if (DblinkRoutineCache)
+		return;
+
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(DblinkRoutineCacheKey);
+	ctl.entrysize = sizeof(DblinkRoutineCacheEntry);
+	ctl.hcxt = CacheMemoryContext;
+
+	DblinkRoutineCache = hash_create("Dblink Routine Metadata Cache", 128, &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static int
+GetDblinkMetadataTTL(Oid serverid)
+{
+	ForeignServer *server;
+	Oid			dblinkid;
+	HeapTuple	tup;
+	int			ttl_sec = 60;
+
+	server = GetForeignServer(serverid);
+	dblinkid = get_dblink_oid(server->servername, true);
+	tup = OidIsValid(dblinkid) ?
+		SearchSysCache1(DBLINKOID, ObjectIdGetDatum(dblinkid)) : NULL;
+	if (HeapTupleIsValid(tup))
+	{
+		Datum		options_datum;
+		bool		isnull;
+		Relation	dblinkrel = NULL;
+
+		/*
+		 * Don't rely on SysCacheGetAttr() here, since it uses the syscache's
+		 * cached tuple descriptor; if that gets out of sync, it can Assert.
+		 */
+		if (tup->t_tableOid == DbLinkRelationId)
+		{
+			dblinkrel = table_open(DbLinkRelationId, AccessShareLock);
+			options_datum = heap_getattr(tup,
+								Anum_pg_dblink_dbloptions,
+								RelationGetDescr(dblinkrel),
+								&isnull);
+			table_close(dblinkrel, AccessShareLock);
+		}
+		else
+		{
+			isnull = true;
+			options_datum = (Datum) 0;
+		}
+
+		if (!isnull)
+		{
+			List	   *options = untransformRelOptions(options_datum);
+			ListCell   *lc;
+
+			foreach(lc, options)
+			{
+				DefElem    *def = (DefElem *) lfirst(lc);
+
+				if (strcmp(def->defname, "meta_ttl") == 0)
+				{
+					ttl_sec = atoi(strVal(def->arg));
+					break;
+				}
+			}
+		}
+		ReleaseSysCache(tup);
+	}
+
+	return ttl_sec;
+}
+
+/*
+ * GetCachedDblinkRoutineMetadata
+ *
+ * Cache key includes (serverid, userid, dblinkname, routine identity, arg sig).
+ */
+DblinkRoutineMetadata *
+GetCachedDblinkRoutineMetadata(Oid serverid,
+						Oid userid,
+						const char *dblinkname,
+						const char *nspname,
+						const char *proname,
+						int nargs,
+						const Oid *argtypes,
+						const int32 *argtypmods)
+{
+	DblinkRoutineCacheKey key;
+	DblinkRoutineCacheEntry *entry;
+	bool		found;
+	TimestampTz now = GetCurrentTimestamp();
+	FdwRoutine *fdw;
+	int			ttl_sec;
+	uint64		argsig;
+	Oid			rettype = InvalidOid;
+	int32		rettypmod = -1;
+	Oid			retcollid = InvalidOid;
+	char	   *remote_sql = NULL;
+	DblinkRoutineMetadata *result;
+
+	/* Build arg signature hash */
+	// TODO: argsig 是对函数参数的摘要，用于从缓存中区分不同参数的同名函数。当前实现是对参数类型和 typmod 的简单哈希，
+	// 可能存在冲突风险。可以考虑使用更强的哈希算法或者增加更多参数信息来降低冲突概率。
+	{
+		uint64 seed = 0;
+		seed = hash_any_extended((const unsigned char *) &nargs, sizeof(nargs), seed);
+		if (nargs > 0)
+		{
+			seed = hash_any_extended((const unsigned char *) argtypes,
+									 sizeof(Oid) * nargs, seed);
+			seed = hash_any_extended((const unsigned char *) argtypmods,
+									 sizeof(int32) * nargs, seed);
+		}
+		argsig = seed;
+	}
+
+	MemSet(&key, 0, sizeof(key));
+	key.serverid = serverid;
+	key.userid = userid;
+	strlcpy(key.dblinkname, dblinkname, NAMEDATALEN);
+	if (nspname)
+		strlcpy(key.nspname, nspname, NAMEDATALEN);
+	strlcpy(key.proname, proname, NAMEDATALEN);
+	key.argsig = argsig;
+
+	ValidateDblinkRoutineCache();
+
+	entry = (DblinkRoutineCacheEntry *) hash_search(DblinkRoutineCache, &key,
+										HASH_FIND, &found);
+	if (found && entry->expires_at > now)
+	{
+		result = palloc0(sizeof(DblinkRoutineMetadata));
+		result->rettype = entry->rettype;
+		result->rettypmod = entry->rettypmod;
+		result->retcollid = entry->retcollid;
+		result->remote_sql = entry->remote_sql ? pstrdup(entry->remote_sql) : NULL;
+		return result;
+	}
+
+	/* Cache miss: resolve via FDW */
+	fdw = GetFdwRoutineByServerId(serverid);
+	if (fdw->GetDblinkRoutineMetadata == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("FDW does not support DBLINK remote routine invocation")));
+
+	if (!fdw->GetDblinkRoutineMetadata(serverid,
+									userid,
+									nspname,
+									proname,
+									nargs,
+									argtypes,
+									argtypmods,
+									&rettype,
+									&rettypmod,
+									&retcollid,
+									&remote_sql))
+		return NULL;
+
+	if (!OidIsValid(rettype))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("FDW did not provide a valid return type for remote routine invocation")));
+
+	ttl_sec = GetDblinkMetadataTTL(serverid);
+
+	{
+		bool		entry_found;
+		MemoryContext oldcxt;
+
+		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+		entry = (DblinkRoutineCacheEntry *) hash_search(DblinkRoutineCache, &key,
+										HASH_ENTER, &entry_found);
+		if (entry_found && entry->remote_sql)
+			pfree(entry->remote_sql);
+
+		entry->rettype = rettype;
+		entry->rettypmod = rettypmod;
+		entry->retcollid = retcollid;
+		entry->remote_sql = remote_sql ? pstrdup(remote_sql) : NULL;
+		entry->expires_at = TimestampTzPlusMilliseconds(now, ttl_sec * 1000L);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	result = palloc0(sizeof(DblinkRoutineMetadata));
+	result->rettype = rettype;
+	result->rettypmod = rettypmod;
+	result->retcollid = retcollid;
+	result->remote_sql = remote_sql;
+
+	return result;
+}
+

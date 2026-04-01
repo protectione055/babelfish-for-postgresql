@@ -148,7 +148,8 @@ static void deparseReturningList(StringInfo buf, RangeTblEntry *rte,
 								 List **retrieved_attrs);
 static void deparseColumnRef(StringInfo buf, int varno, int varattno,
 							 RangeTblEntry *rte, bool qualify_col);
-static void deparseRelation(StringInfo buf, Relation rel);
+static void deparseRelation(StringInfo buf, Relation rel,
+							const RangeTblEntry *rte);
 static void deparseExpr(Expr *node, deparse_expr_cxt *context);
 static void deparseVar(Var *node, deparse_expr_cxt *context);
 static void deparseConst(Const *node, deparse_expr_cxt *context, int showtype);
@@ -1349,16 +1350,25 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 		 * required to be fetched from the foreign server.
 		 */
 		RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
+		Relation	rel = NULL;
 
-		/*
-		 * Core code already has some lock on each rel being planned, so we
-		 * can use NoLock here.
-		 */
-		Relation	rel = table_open(rte->relid, NoLock);
-
-		deparseTargetList(buf, rte, foreignrel->relid, rel, false,
-						  fpinfo->attrs_used, false, retrieved_attrs);
-		table_close(rel, NoLock);
+		if (rte->rtekind == RTE_RELATION)
+		{
+			/*
+			 * Core code already has some lock on each rel being planned, so we
+			 * can use NoLock here.
+			 */
+			rel = table_open(rte->relid, NoLock);
+			deparseTargetList(buf, rte, foreignrel->relid, rel, false,
+							  fpinfo->attrs_used, false, retrieved_attrs);
+			table_close(rel, NoLock);
+		}
+		else
+		{
+			Assert(rte->rtekind == RTE_DBLINK);
+			deparseTargetList(buf, rte, foreignrel->relid, NULL, false,
+							  fpinfo->attrs_used, false, retrieved_attrs);
+		}
 	}
 }
 
@@ -1411,24 +1421,34 @@ deparseTargetList(StringInfo buf,
 				  bool qualify_col,
 				  List **retrieved_attrs)
 {
-	TupleDesc	tupdesc = RelationGetDescr(rel);
+	TupleDesc	tupdesc = NULL;
 	bool		have_wholerow;
 	bool		first;
-	int			i;
+	int		i;
+	int		natts;
 
 	*retrieved_attrs = NIL;
 
-	/* If there's a whole-row reference, we'll need all the columns. */
-	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
-								  attrs_used);
+	/*
+	 * If there's a whole-row reference, we'll need all the columns.
+	 * For @dblink, always fetch all remote columns: the local anchor table's
+	 * physical columns don't match remote metadata, so relying on attrs_used
+	 * can omit needed remote columns.
+	 */
+	have_wholerow = rte->dblinkname ||
+		bms_is_member(0 - FirstLowInvalidHeapAttributeNumber, attrs_used);
+
+	if (!rte->dblinkname)
+		tupdesc = RelationGetDescr(rel);
 
 	first = true;
-	for (i = 1; i <= tupdesc->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+	natts = rte->dblinkname ? list_length(rte->coltypes) : tupdesc->natts;
 
-		/* Ignore dropped attributes. */
-		if (attr->attisdropped)
+	for (i = 1; i <= natts; i++)
+	{
+		/* Ignore dropped attributes for local relations. */
+		if (!rte->dblinkname &&
+			TupleDescAttr(tupdesc, i - 1)->attisdropped)
 			continue;
 
 		if (have_wholerow ||
@@ -1978,14 +1998,23 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	else
 	{
 		RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
+		Relation	rel = NULL;
 
-		/*
-		 * Core code already has some lock on each rel being planned, so we
-		 * can use NoLock here.
-		 */
-		Relation	rel = table_open(rte->relid, NoLock);
-
-		deparseRelation(buf, rel);
+		if (rte->rtekind == RTE_RELATION)
+		{
+			/*
+			 * Core code already has some lock on each rel being planned, so we
+			 * can use NoLock here.
+			 */
+			rel = table_open(rte->relid, NoLock);
+			deparseRelation(buf, rel, rte);
+			table_close(rel, NoLock);
+		}
+		else
+		{
+			Assert(rte->rtekind == RTE_DBLINK);
+			deparseRelation(buf, NULL, rte);
+		}
 
 		/*
 		 * Add a unique alias to avoid any conflict in relation names due to
@@ -1994,8 +2023,6 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 		 */
 		if (use_alias)
 			appendStringInfo(buf, " %s%d", REL_ALIAS_PREFIX, foreignrel->relid);
-
-		table_close(rel, NoLock);
 	}
 }
 
@@ -2092,7 +2119,7 @@ deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 	ListCell   *lc;
 
 	appendStringInfoString(buf, "INSERT INTO ");
-	deparseRelation(buf, rel);
+	deparseRelation(buf, rel, rte);
 
 	if (targetAttrs)
 	{
@@ -2225,7 +2252,7 @@ deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 	ListCell   *lc;
 
 	appendStringInfoString(buf, "UPDATE ");
-	deparseRelation(buf, rel);
+	deparseRelation(buf, rel, rte);
 	appendStringInfoString(buf, " SET ");
 
 	pindex = 2;					/* ctid is always the first param */
@@ -2299,7 +2326,7 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 	context.params_list = params_list;
 
 	appendStringInfoString(buf, "UPDATE ");
-	deparseRelation(buf, rel);
+	deparseRelation(buf, rel, rte);
 	if (foreignrel->reloptkind == RELOPT_JOINREL)
 		appendStringInfo(buf, " %s%d", REL_ALIAS_PREFIX, rtindex);
 	appendStringInfoString(buf, " SET ");
@@ -2365,7 +2392,7 @@ deparseDeleteSql(StringInfo buf, RangeTblEntry *rte,
 				 List **retrieved_attrs)
 {
 	appendStringInfoString(buf, "DELETE FROM ");
-	deparseRelation(buf, rel);
+	deparseRelation(buf, rel, rte);
 	appendStringInfoString(buf, " WHERE ctid = $1");
 
 	deparseReturningList(buf, rte, rtindex, rel,
@@ -2407,7 +2434,7 @@ deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 	context.params_list = params_list;
 
 	appendStringInfoString(buf, "DELETE FROM ");
-	deparseRelation(buf, rel);
+	deparseRelation(buf, rel, planner_rt_fetch(rtindex, root));
 	if (foreignrel->reloptkind == RELOPT_JOINREL)
 		appendStringInfo(buf, " %s%d", REL_ALIAS_PREFIX, rtindex);
 
@@ -2502,7 +2529,7 @@ deparseAnalyzeSizeSql(StringInfo buf, Relation rel)
 
 	/* We'll need the remote relation name as a literal. */
 	initStringInfo(&relname);
-	deparseRelation(&relname, rel);
+	deparseRelation(&relname, rel, NULL);
 
 	appendStringInfoString(buf, "SELECT pg_catalog.pg_relation_size(");
 	deparseStringLiteral(buf, relname.data);
@@ -2524,7 +2551,7 @@ deparseAnalyzeInfoSql(StringInfo buf, Relation rel)
 
 	/* We'll need the remote relation name as a literal. */
 	initStringInfo(&relname);
-	deparseRelation(&relname, rel);
+	deparseRelation(&relname, rel, NULL);
 
 	appendStringInfoString(buf, "SELECT reltuples, relkind FROM pg_catalog.pg_class WHERE oid = ");
 	deparseStringLiteral(buf, relname.data);
@@ -2612,7 +2639,7 @@ deparseAnalyzeSql(StringInfo buf, Relation rel,
 	 * selected sampling method.
 	 */
 	appendStringInfoString(buf, " FROM ");
-	deparseRelation(buf, rel);
+	deparseRelation(buf, rel, NULL);
 
 	switch (sample_method)
 	{
@@ -2659,7 +2686,7 @@ deparseTruncateSql(StringInfo buf,
 		if (cell != list_head(rels))
 			appendStringInfoString(buf, ", ");
 
-		deparseRelation(buf, rel);
+		deparseRelation(buf, rel, NULL);
 	}
 
 	appendStringInfo(buf, " %s IDENTITY",
@@ -2723,7 +2750,10 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 		 * The lock on the relation will be held by upper callers, so it's
 		 * fine to open it with no lock here.
 		 */
-		rel = table_open(rte->relid, NoLock);
+		if (rte->dblinkname)
+			rel = NULL;
+		else
+			rel = table_open(rte->relid, NoLock);
 
 		/*
 		 * The local name of the foreign table can not be recognized by the
@@ -2758,7 +2788,8 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 		if (qualify_col)
 			appendStringInfoString(buf, " END");
 
-		table_close(rel, NoLock);
+		if (rel)
+			table_close(rel, NoLock);
 		bms_free(attrs_used);
 	}
 	else
@@ -2774,7 +2805,10 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 		 * If it's a column of a foreign table, and it has the column_name FDW
 		 * option, use that value.
 		 */
-		options = GetForeignColumnOptions(rte->relid, varattno);
+		if (rte->dblinkname)
+			options = NIL;
+		else
+			options = GetForeignColumnOptions(rte->relid, varattno);
 		foreach(lc, options)
 		{
 			DefElem    *def = (DefElem *) lfirst(lc);
@@ -2788,10 +2822,17 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 
 		/*
 		 * If it's a column of a regular table or it doesn't have column_name
-		 * FDW option, use attribute name.
+		 * FDW option, use attribute name. For @dblink references, use the
+		 * RTE's effective column names instead of the local anchor catalog.
 		 */
 		if (colname == NULL)
-			colname = get_attname(rte->relid, varattno, false);
+		{
+			if (rte->dblinkname &&
+				varattno > 0 && varattno <= list_length(rte->eref->colnames))
+				colname = strVal(list_nth(rte->eref->colnames, varattno - 1));
+			else
+				colname = get_attname(rte->relid, varattno, false);
+		}
 
 		if (qualify_col)
 			ADD_REL_QUALIFIER(buf, varno);
@@ -2806,26 +2847,32 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
  * Similarly, schema_name FDW option overrides schema name.
  */
 static void
-deparseRelation(StringInfo buf, Relation rel)
+deparseRelation(StringInfo buf, Relation rel, const RangeTblEntry *rte)
 {
 	ForeignTable *table;
 	const char *nspname = NULL;
 	const char *relname = NULL;
 	ListCell   *lc;
 
-	/* obtain additional catalog information. */
-	table = GetForeignTable(RelationGetRelid(rel));
+	if (rte && rte->dblinkname)
+	{
+		nspname = rte->dblinknamespace;
+		relname = rte->dblinkrelname;
+	}
+
+	/* obtain additional catalog information, if any. */
+	table = (rel != NULL) ? GetForeignTable(RelationGetRelid(rel)) : NULL;
 
 	/*
 	 * Use value of FDW options if any, instead of the name of object itself.
 	 */
-	foreach(lc, table->options)
+	foreach(lc, table ? table->options : NIL)
 	{
 		DefElem    *def = (DefElem *) lfirst(lc);
 
-		if (strcmp(def->defname, "schema_name") == 0)
+		if (nspname == NULL && strcmp(def->defname, "schema_name") == 0)
 			nspname = defGetString(def);
-		else if (strcmp(def->defname, "table_name") == 0)
+		else if (relname == NULL && strcmp(def->defname, "table_name") == 0)
 			relname = defGetString(def);
 	}
 
@@ -2833,12 +2880,30 @@ deparseRelation(StringInfo buf, Relation rel)
 	 * Note: we could skip printing the schema name if it's pg_catalog, but
 	 * that doesn't seem worth the trouble.
 	 */
-	if (nspname == NULL)
-		nspname = get_namespace_name(RelationGetNamespace(rel));
 	if (relname == NULL)
-		relname = RelationGetRelationName(rel);
-
-	appendStringInfo(buf, "%s.%s",
+	{
+		if (rel != NULL)
+			relname = RelationGetRelationName(rel);
+		else
+			elog(ERROR, "could not determine remote relation name");
+	}
+	if (nspname == NULL)
+	{
+		if (rte && rte->dblinkname)
+			nspname = "public";
+		else
+		{
+			if (rel != NULL)
+				nspname = get_namespace_name(RelationGetNamespace(rel));
+			else
+				nspname = "public";
+		}
+		appendStringInfo(buf, "%s.%s",
+					 quote_identifier(nspname),
+					 quote_identifier(relname));
+	}
+	else
+		appendStringInfo(buf, "%s.%s",
 					 quote_identifier(nspname), quote_identifier(relname));
 }
 

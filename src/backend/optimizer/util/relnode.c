@@ -339,6 +339,10 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 			/* Table --- retrieve statistics from the system catalogs */
 			get_relation_info(root, rte->relid, rte->inh, rel);
 			break;
+		case RTE_DBLINK:
+			/* @dblink remote object --- derive info from cached remote metadata */
+			get_dblink_relation_info(root, rte, rel);
+			break;
 		case RTE_SUBQUERY:
 		case RTE_FUNCTION:
 		case RTE_TABLEFUNC:

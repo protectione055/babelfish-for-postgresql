@@ -15,9 +15,11 @@
 #include <limits.h>
 
 #include "access/htup_details.h"
+#include "access/tupdesc.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_class.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_opfamily.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -39,12 +41,14 @@
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
+#include "parser/parse_type.h"
 #include "parser/parsetree.h"
 #include "postgres_fdw.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/guc.h"
+#include "common/hashfn.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -139,6 +143,7 @@ typedef struct PgFdwScanState
 {
 	Relation	rel;			/* relcache entry for the foreign table. NULL
 								 * for a foreign join scan. */
+	bool		is_dblink;		/* true if this is an @dblink scan */
 	TupleDesc	tupdesc;		/* tuple descriptor of scan */
 	AttInMetadata *attinmeta;	/* attribute datatype conversion metadata */
 
@@ -404,6 +409,31 @@ static bool postgresAnalyzeForeignTable(Relation relation,
 										BlockNumber *totalpages);
 static List *postgresImportForeignSchema(ImportForeignSchemaStmt *stmt,
 										 Oid serverOid);
+static TupleDesc postgresGetDblinkTableMetadata(Oid serverOid,
+											 Oid userid,
+											 const char *remote_schema,
+								 const char *remote_table);
+static bool postgresGetDblinkRoutineMetadata(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 int nargs,
+									 const Oid *argtypes,
+									 const int32 *argtypmods,
+									 Oid *rettype,
+									 int32 *rettypmod,
+									 Oid *retcollid,
+									 char **remote_sql);
+static Datum postgresExecDblinkRoutine(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 const char *remote_sql,
+									 int nargs,
+									 const Oid *argtypes,
+									 const Datum *argvalues,
+									 const bool *argnulls,
+									 bool *isnull);
 static void postgresGetForeignJoinPaths(PlannerInfo *root,
 										RelOptInfo *joinrel,
 										RelOptInfo *outerrel,
@@ -513,7 +543,7 @@ static HeapTuple make_tuple_from_result_row(PGresult *res,
 											Relation rel,
 											AttInMetadata *attinmeta,
 											List *retrieved_attrs,
-											ForeignScanState *fsstate,
+						   ForeignScanState *fsstate,
 											MemoryContext temp_context);
 static void conversion_error_callback(void *arg);
 static bool foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel,
@@ -597,6 +627,11 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 	/* Support functions for IMPORT FOREIGN SCHEMA */
 	routine->ImportForeignSchema = postgresImportForeignSchema;
 
+	/* Support functions for @dblink remote metadata */
+	routine->GetDblinkTableMetadata = postgresGetDblinkTableMetadata;
+	routine->GetDblinkRoutineMetadata = postgresGetDblinkRoutineMetadata;
+	routine->ExecDblinkRoutine = postgresExecDblinkRoutine;
+
 	/* Support functions for join push-down */
 	routine->GetForeignJoinPaths = postgresGetForeignJoinPaths;
 
@@ -626,6 +661,8 @@ postgresGetForeignRelSize(PlannerInfo *root,
 {
 	PgFdwRelationInfo *fpinfo;
 	ListCell   *lc;
+	RangeTblEntry *rte = NULL;
+	bool		is_dblink = false;
 
 	/*
 	 * We use PgFdwRelationInfo to pass various information to subsequent
@@ -637,9 +674,27 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	/* Base foreign tables need to be pushed down always. */
 	fpinfo->pushdown_safe = true;
 
-	/* Look up foreign-table catalog info. */
-	fpinfo->table = GetForeignTable(foreigntableid);
-	fpinfo->server = GetForeignServer(fpinfo->table->serverid);
+	/*
+	 * Look up catalog info.
+	 * For @dblink scans there is no local foreign-table OID; the server is
+	 * identified by the database link name.
+	 */
+	if (IS_SIMPLE_REL(baserel) && baserel->relid > 0)
+		rte = planner_rt_fetch(baserel->relid, root);
+
+	is_dblink = (rte && rte->rtekind == RTE_DBLINK && rte->dblinkname != NULL);
+
+	if (is_dblink)
+	{
+		fpinfo->table = NULL;
+		fpinfo->server = GetForeignServer(baserel->serverid);
+	}
+	else
+	{
+		/* Ordinary foreign-table scan */
+		fpinfo->table = GetForeignTable(foreigntableid);
+		fpinfo->server = GetForeignServer(fpinfo->table->serverid);
+	}
 
 	/*
 	 * Extract user-settable option values.  Note that per-table settings of
@@ -654,7 +709,8 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	fpinfo->async_capable = false;
 
 	apply_server_options(fpinfo);
-	apply_table_options(fpinfo);
+	if (!is_dblink)
+		apply_table_options(fpinfo);
 
 	/*
 	 * If the table or the server is configured to use remote estimates,
@@ -1442,6 +1498,8 @@ get_tupdesc_for_join_scan_tuples(ForeignScanState *node)
 	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	EState	   *estate = node->ss.ps.state;
 	TupleDesc	tupdesc;
+	ListCell   *lc;
+	int			attnum;
 
 	/*
 	 * The core code has already set up a scan tuple slot based on
@@ -1453,12 +1511,27 @@ get_tupdesc_for_join_scan_tuples(ForeignScanState *node)
 	 * we can convert them to a composite type the local server knows.
 	 */
 	tupdesc = CreateTupleDescCopy(node->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
-	for (int i = 0; i < tupdesc->natts; i++)
+
+	/*
+	 * Map non-junk entries in fdw_scan_tlist to tupdesc attributes.
+	 * This avoids assuming list length == natts.
+	 */
+	attnum = 0;
+	foreach(lc, fsplan->fdw_scan_tlist)
 	{
-		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Form_pg_attribute att;
 		Var		   *var;
 		RangeTblEntry *rte;
 		Oid			reltype;
+
+		if (tle->resjunk)
+			continue;
+		if (attnum >= tupdesc->natts)
+			break;
+
+		att = TupleDescAttr(tupdesc, attnum);
+		attnum++;
 
 		/* Nothing to do if it's not a generic RECORD attribute */
 		if (att->atttypid != RECORDOID || att->atttypmod >= 0)
@@ -1468,8 +1541,7 @@ get_tupdesc_for_join_scan_tuples(ForeignScanState *node)
 		 * If we can't identify the referenced table, do nothing.  This'll
 		 * likely lead to failure later, but perhaps we can muddle through.
 		 */
-		var = (Var *) list_nth_node(TargetEntry, fsplan->fdw_scan_tlist,
-									i)->expr;
+		var = (Var *) tle->expr;
 		if (!IsA(var, Var) || var->varattno != 0)
 			continue;
 		rte = list_nth(estate->es_range_table, var->varno - 1);
@@ -1496,7 +1568,7 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	PgFdwScanState *fsstate;
 	RangeTblEntry *rte;
 	Oid			userid;
-	ForeignTable *table;
+	ForeignTable *table = NULL;
 	UserMapping *user;
 	int			rtindex;
 	int			numParams;
@@ -1524,9 +1596,17 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 		rtindex = bms_next_member(fsplan->fs_base_relids, -1);
 	rte = exec_rt_fetch(rtindex, estate);
 
-	/* Get info about foreign table. */
-	table = GetForeignTable(rte->relid);
-	user = GetUserMapping(userid, table->serverid);
+	fsstate->is_dblink = (rte && rte->rtekind == RTE_DBLINK &&
+						rte->dblinkname != NULL);
+
+	/* Get info about foreign table/server and user mapping. */
+	if (fsstate->is_dblink)
+		user = GetUserMapping(userid, fsplan->fs_server);
+	else
+	{
+		table = GetForeignTable(rte->relid);
+		user = GetUserMapping(userid, table->serverid);
+	}
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
@@ -1561,7 +1641,10 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	if (fsplan->scan.scanrelid > 0)
 	{
 		fsstate->rel = node->ss.ss_currentRelation;
-		fsstate->tupdesc = RelationGetDescr(fsstate->rel);
+		if (fsstate->is_dblink)
+			fsstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+		else
+			fsstate->tupdesc = RelationGetDescr(fsstate->rel);
 	}
 	else
 	{
@@ -2494,7 +2577,7 @@ postgresPlanDirectModify(PlannerInfo *root,
 	}
 	else
 		foreignrel = root->simple_rel_array[resultRelation];
-	rte = root->simple_rte_array[resultRelation];
+	rte = planner_rt_fetch(resultRelation, root);
 	fpinfo = (PgFdwRelationInfo *) foreignrel->fdw_private;
 
 	/*
@@ -2903,21 +2986,45 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 				rti += rtoffset;
 				Assert(bms_is_member(rti, plan->fs_base_relids));
 				rte = rt_fetch(rti, es->rtable);
-				Assert(rte->rtekind == RTE_RELATION);
 				/* This logic should agree with explain.c's ExplainTargetRel */
-				relname = get_rel_name(rte->relid);
-				if (es->verbose)
+				if (rte->rtekind == RTE_RELATION)
 				{
-					char	   *namespace;
+					relname = get_rel_name(rte->relid);
+					if (es->verbose)
+					{
+						char	   *namespace;
 
-					namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
-					appendStringInfo(relations, "%s.%s",
+						namespace = get_namespace_name_or_temp(get_rel_namespace(rte->relid));
+						appendStringInfo(relations, "%s.%s",
 									 quote_identifier(namespace),
 									 quote_identifier(relname));
+					}
+					else
+						appendStringInfoString(relations,
+										   quote_identifier(relname));
+				}
+				else if (rte->rtekind == RTE_DBLINK)
+				{
+					const char *dblink_namespace = rte->dblinknamespace ? rte->dblinknamespace : "?";
+					const char *dblink_relname = rte->dblinkrelname ? rte->dblinkrelname : "?";
+					const char *dblink_name = rte->dblinkname ? rte->dblinkname : "?";
+
+					relname = (char *) dblink_relname;
+					if (es->verbose)
+						appendStringInfo(relations, "%s.%s@%s",
+									 quote_identifier(dblink_namespace),
+									 quote_identifier(dblink_relname),
+									 quote_identifier(dblink_name));
+					else
+						appendStringInfo(relations, "%s@%s",
+									 quote_identifier(dblink_relname),
+									 quote_identifier(dblink_name));
 				}
 				else
-					appendStringInfoString(relations,
-										   quote_identifier(relname));
+				{
+					relname = "?";
+					appendStringInfoString(relations, "?");
+				}
 				refname = (char *) list_nth(es->rtable_names, rti - 1);
 				if (refname == NULL)
 					refname = rte->eref->aliasname;
@@ -3870,14 +3977,14 @@ fetch_more_data(ForeignScanState *node)
 		{
 			Assert(IsA(node->ss.ps.plan, ForeignScan));
 
-			fsstate->tuples[i] =
-				make_tuple_from_result_row(res, i,
-										   fsstate->rel,
-										   fsstate->attinmeta,
-										   fsstate->retrieved_attrs,
-										   node,
-										   fsstate->temp_cxt);
-		}
+		fsstate->tuples[i] =
+			make_tuple_from_result_row(res, i,
+									   fsstate->rel,
+									   fsstate->attinmeta,
+									   fsstate->retrieved_attrs,
+								   node,
+									   fsstate->temp_cxt);
+	}
 
 		/* Update fetch_ct_2 */
 		if (fsstate->fetch_ct_2 < 2)
@@ -5744,6 +5851,339 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 }
 
 /*
+ * Fetch remote column metadata for object@dblink and build a TupleDesc.
+ */
+static TupleDesc
+postgresGetDblinkTableMetadata(Oid serverOid,
+								   Oid userid,
+								   const char *remote_schema,
+							   const char *remote_table)
+{
+	ForeignServer *server;
+	UserMapping *mapping;
+	PGconn	   *conn;
+	StringInfoData buf;
+	PGresult   *res;
+	int			ncols;
+	int			row;
+	TupleDesc	tupdesc;
+
+	if (remote_table == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("remote table name is required for database link metadata")));
+
+	server = GetForeignServer(serverOid);
+	mapping = GetUserMapping(userid, server->serverid);
+	conn = GetConnection(mapping, false, NULL);
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf,
+						   "SELECT a.attname, "
+						   "  format_type(a.atttypid, a.atttypmod), "
+						   "  collname, collnsp.nspname "
+						   "FROM pg_class c "
+						   "  JOIN pg_namespace n ON relnamespace = n.oid "
+						   "  JOIN pg_attribute a ON attrelid = c.oid AND attnum > 0 "
+						   "    AND NOT attisdropped "
+						   "  LEFT JOIN pg_collation coll ON coll.oid = attcollation "
+						   "  LEFT JOIN pg_namespace collnsp ON collnsp.oid = collnamespace "
+						   "WHERE c.relkind IN ("
+						   CppAsString2(RELKIND_RELATION) ","
+						   CppAsString2(RELKIND_VIEW) ","
+						   CppAsString2(RELKIND_FOREIGN_TABLE) ","
+						   CppAsString2(RELKIND_MATVIEW) ","
+						   CppAsString2(RELKIND_PARTITIONED_TABLE) ") ");
+
+	/*
+	 * If remote_schema is not specified, default to "public".
+	 *
+	 * We intentionally do not rely on remote search_path, because the
+	 * postgres_fdw connection setup restricts it to pg_catalog for safety.
+	 */
+	if (remote_schema != NULL && remote_schema[0] != '\0')
+	{
+		appendStringInfoString(&buf, " AND n.nspname = ");
+		deparseStringLiteral(&buf, remote_schema);
+	}
+	else
+		appendStringInfoString(&buf, " AND n.nspname = 'public' ");
+
+	appendStringInfoString(&buf, " AND c.relname = ");
+	deparseStringLiteral(&buf, remote_table);
+
+	appendStringInfoString(&buf, " ORDER BY a.attnum");
+
+	res = pgfdw_exec_query(conn, buf.data, NULL);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(ERROR, res, conn, false, buf.data);
+
+	ncols = PQntuples(res);
+	if (ncols == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation \"%s\" does not exist on foreign server \"%s\"",
+						remote_table, server->servername)));
+
+	tupdesc = CreateTemplateTupleDesc(ncols);
+
+	for (row = 0; row < ncols; row++)
+	{
+		char		*attname = PQgetvalue(res, row, 0);
+		char		*typename = PQgetvalue(res, row, 1);
+		char		*collname = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
+		char		*collnsp = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
+		Oid			typid;
+		int32		typmod;
+		Oid			collid = InvalidOid;
+		List		*collnames;
+
+		if (!parseTypeString(typename, &typid, &typmod, NULL))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("could not parse remote type \"%s\"", typename)));
+
+		TupleDescInitEntry(tupdesc, row + 1, attname, typid, typmod, 0);
+
+		if (collname && collnsp)
+		{
+			collnames = list_make2(makeString(pstrdup(collnsp)),
+								 makeString(pstrdup(collname)));
+			collid = get_collation_oid(collnames, true);
+		}
+		if (!OidIsValid(collid))
+			collid = get_typcollation(typid);
+
+		TupleDescInitEntryCollation(tupdesc, row + 1, collid);
+
+	}
+
+	PQclear(res);
+	return tupdesc;
+}
+
+/*
+ * Resolve remote routine metadata for func@dblink(...) when using postgres_fdw.
+ *
+ * We let the remote PostgreSQL server perform overload resolution by
+ * preparing a parameterized SELECT expression, then inspecting the result
+ * column type and typmod from PQdescribePrepared.
+ */
+static bool
+postgresGetDblinkRoutineMetadata(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 int nargs,
+									 const Oid *argtypes,
+									 const int32 *argtypmods,
+									 Oid *rettype,
+									 int32 *rettypmod,
+									 Oid *retcollid,
+									 char **remote_sql)
+{
+	ForeignServer *server;
+	UserMapping *mapping;
+	PGconn	   *conn;
+	StringInfoData sql;
+	char		stmtname[NAMEDATALEN];
+	PGresult   *res;
+	PGresult   *desc;
+	Oid			rt;
+	int32		rtm;
+	const char *sqlstate;
+	int			i;
+	static uint32	stmt_counter = 0;
+	const char *nsp;
+
+	if (rettype)
+		*rettype = InvalidOid;
+	if (rettypmod)
+		*rettypmod = -1;
+	if (retcollid)
+		*retcollid = InvalidOid;
+	if (remote_sql)
+		*remote_sql = NULL;
+
+	if (remote_routine == NULL || remote_routine[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("remote routine name is required for database link metadata")));
+
+	/* Default schema to public to avoid relying on remote search_path. */
+	nsp = (remote_schema && remote_schema[0] != '\0') ? remote_schema : "public";
+
+	server = GetForeignServer(serverOid);
+	mapping = GetUserMapping(userid, server->serverid);
+	conn = GetConnection(mapping, false, NULL);
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT %s.%s(",
+				 quote_identifier(nsp),
+				 quote_identifier(remote_routine));
+	for (i = 0; i < nargs; i++)
+	{
+		if (i > 0)
+			appendStringInfoString(&sql, ", ");
+		appendStringInfo(&sql, "$%d", i + 1);
+	}
+	appendStringInfoChar(&sql, ')');
+
+	snprintf(stmtname, sizeof(stmtname), "dblink_routine_%u", ++stmt_counter);
+
+	res = PQprepare(conn, stmtname, sql.data, nargs, argtypes);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+		if (sqlstate && strcmp(sqlstate, "42725") == 0)
+		{
+			/* ambiguous_function */
+			PQclear(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+					 errmsg("ambiguous remote overload resolution for routine \"%s\"", remote_routine),
+					 errhint("Add an explicit cast to disambiguate the remote routine call.")));
+		}
+		if (sqlstate && strcmp(sqlstate, "42883") == 0)
+		{
+			/* undefined_function */
+			PQclear(res);
+			return false;
+		}
+
+		pgfdw_report_error(ERROR, res, conn, false, sql.data);
+	}
+	PQclear(res);
+
+	desc = PQdescribePrepared(conn, stmtname);
+	if (PQresultStatus(desc) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, desc, conn, false, sql.data);
+
+	if (PQnfields(desc) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("FDW returned unexpected column shape while resolving remote routine metadata")));
+
+	rt = PQftype(desc, 0);
+	rtm = PQfmod(desc, 0);
+	PQclear(desc);
+
+	if (!OidIsValid(rt))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("could not determine return type for remote routine \"%s\"", remote_routine)));
+
+	if (rettype)
+		*rettype = rt;
+	if (rettypmod)
+		*rettypmod = rtm;
+	if (retcollid)
+		*retcollid = get_typcollation(rt);
+
+	if (remote_sql)
+		*remote_sql = pstrdup(sql.data);
+
+	return true;
+}
+
+/*
+ * Execute remote routine call for func@dblink(...) when using postgres_fdw.
+ */
+static Datum
+postgresExecDblinkRoutine(Oid serverOid,
+									 Oid userid,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 const char *remote_sql,
+									 int nargs,
+									 const Oid *argtypes,
+									 const Datum *argvalues,
+									 const bool *argnulls,
+									 bool *isnull)
+{
+	ForeignServer *server;
+	UserMapping *mapping;
+	PGconn	   *conn;
+	PGresult   *res;
+	const char **param_values;
+	FmgrInfo   *param_flinfo;
+	Oid			typefnoid;
+	bool		isvarlena;
+	int			nestlevel;
+	int			i;
+	Oid			rt;
+	int32		rtm;
+	Oid		typinput;
+	Oid		typioparam;
+	FmgrInfo	in_finfo;
+	Datum		result;
+	char	   *resval;
+
+	(void) remote_schema;
+	(void) remote_routine;
+
+	if (isnull)
+		*isnull = false;
+
+	if (remote_sql == NULL || remote_sql[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("FDW did not provide remote SQL for routine execution")));
+
+	server = GetForeignServer(serverOid);
+	mapping = GetUserMapping(userid, server->serverid);
+	conn = GetConnection(mapping, false, NULL);
+
+	param_values = (const char **) palloc0(sizeof(char *) * nargs);
+	param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * nargs);
+
+	for (i = 0; i < nargs; i++)
+	{
+		getTypeOutputInfo(argtypes[i], &typefnoid, &isvarlena);
+		fmgr_info(typefnoid, &param_flinfo[i]);
+	}
+
+	nestlevel = set_transmission_modes();
+	for (i = 0; i < nargs; i++)
+	{
+		if (argnulls[i])
+			param_values[i] = NULL;
+		else
+			param_values[i] = OutputFunctionCall(&param_flinfo[i], argvalues[i]);
+	}
+	reset_transmission_modes(nestlevel);
+
+	res = PQexecParams(conn, remote_sql, nargs, argtypes,
+					 param_values, NULL, NULL, 0);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		pgfdw_report_error(ERROR, res, conn, false, remote_sql);
+
+	if (PQnfields(res) != 1 || PQntuples(res) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("unexpected result shape from remote routine execution")));
+
+	if (PQgetisnull(res, 0, 0))
+	{
+		if (isnull)
+			*isnull = true;
+		PQclear(res);
+		return (Datum) 0;
+	}
+
+	rt = PQftype(res, 0);
+	rtm = PQfmod(res, 0);
+	resval = PQgetvalue(res, 0, 0);
+
+	getTypeInputInfo(rt, &typinput, &typioparam);
+	fmgr_info(typinput, &in_finfo);
+	result = InputFunctionCall(&in_finfo, resval, typioparam, rtm);
+
+	PQclear(res);
+	return result;
+}
+
+/*
  * Check if reltarget is safe enough to push down semi-join.  Reltarget is not
  * safe, if it contains references to inner rel relids, which do not belong to
  * outer rel.
@@ -7571,6 +8011,7 @@ make_tuple_from_result_row(PGresult *res,
 {
 	HeapTuple	tuple;
 	TupleDesc	tupdesc;
+	bool		is_dblink = false;
 	Datum	   *values;
 	bool	   *nulls;
 	ItemPointer ctid = NULL;
@@ -7590,15 +8031,32 @@ make_tuple_from_result_row(PGresult *res,
 	oldcontext = MemoryContextSwitchTo(temp_context);
 
 	/*
-	 * Get the tuple descriptor for the row.  Use the rel's tupdesc if rel is
-	 * provided, otherwise look to the scan node's ScanTupleSlot.
+	 * Get the tuple descriptor for the row.
+	 *
+	 * For @dblink scans, prefer the scan slot's descriptor (remote metadata),
+	 * which may differ from the local anchor table's physical columns.
 	 */
-	if (rel)
-		tupdesc = RelationGetDescr(rel);
+	if (fsstate)
+	{
+		PgFdwScanState *scanstate = (PgFdwScanState *) fsstate->fdw_state;
+
+		/*
+		 * make_tuple_from_result_row() is expected to receive ForeignScanState
+		 * only for SELECT-style foreign scans.  Other callers should pass NULL.
+		 */
+		if (scanstate)
+			is_dblink = scanstate->is_dblink;
+	}
+
+	if (fsstate && (is_dblink || rel == NULL))
+	{
+		Assert(fsstate->ss.ss_ScanTupleSlot);
+		tupdesc = fsstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	}
 	else
 	{
-		Assert(fsstate);
-		tupdesc = fsstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+		Assert(rel);
+		tupdesc = RelationGetDescr(rel);
 	}
 
 	values = (Datum *) palloc0(tupdesc->natts * sizeof(Datum));

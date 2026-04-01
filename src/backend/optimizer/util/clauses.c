@@ -557,6 +557,10 @@ contain_volatile_functions_walker(Node *node, void *context)
 {
 	if (node == NULL)
 		return false;
+
+	/* Remote routine invocation via @dblink is always treated as VOLATILE */
+	if (IsA(node, DblinkFuncExpr))
+		return true;
 	/* Check for volatile functions in node itself */
 	if (check_functions_in_node(node, contain_volatile_functions_checker,
 								context))
@@ -693,6 +697,10 @@ contain_volatile_functions_not_nextval_walker(Node *node, void *context)
 {
 	if (node == NULL)
 		return false;
+
+	/* Remote routine invocation via @dblink is always treated as VOLATILE */
+	if (IsA(node, DblinkFuncExpr))
+		return true;
 	/* Check for volatile functions in node itself */
 	if (check_functions_in_node(node,
 								contain_volatile_functions_not_nextval_checker,
@@ -836,6 +844,10 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 {
 	if (node == NULL)
 		return false;
+
+	/* Remote routine invocation via @dblink is always parallel-unsafe */
+	if (IsA(node, DblinkFuncExpr))
+		return max_parallel_hazard_test(PROPARALLEL_UNSAFE, context);
 
 	/* Check for hazardous functions in node itself */
 	if (check_functions_in_node(node, max_parallel_hazard_checker,

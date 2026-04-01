@@ -36,6 +36,12 @@ tests += {
   'regress': {
     'sql': [
       'postgres_fdw',
+      'database_link',
+      'dblink_routine',
+      'dblink_cache',
+      'dblink_errors',
+      'dblink_server_cache',
+      'dblink_plpgsql',
       'query_cancel',
     ],
     'regress_args': ['--dlpath', meson.build_root() / 'src/test/regress'],

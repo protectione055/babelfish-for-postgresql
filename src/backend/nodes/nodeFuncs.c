@@ -78,6 +78,9 @@ exprType(const Node *expr)
 		case T_FuncExpr:
 			type = ((const FuncExpr *) expr)->funcresulttype;
 			break;
+		case T_DblinkFuncExpr:
+			type = ((const DblinkFuncExpr *) expr)->funcresulttype;
+			break;
 		case T_NamedArgExpr:
 			type = exprType((Node *) ((const NamedArgExpr *) expr)->arg);
 			break;
@@ -322,6 +325,8 @@ exprTypmod(const Node *expr)
 					return coercedTypmod;
 			}
 			break;
+		case T_DblinkFuncExpr:
+			return ((const DblinkFuncExpr *) expr)->funcresulttypmod;
 		case T_NamedArgExpr:
 			return exprTypmod((Node *) ((const NamedArgExpr *) expr)->arg);
 		case T_NullIfExpr:
@@ -859,6 +864,9 @@ exprCollation(const Node *expr)
 		case T_FuncExpr:
 			coll = ((const FuncExpr *) expr)->funccollid;
 			break;
+		case T_DblinkFuncExpr:
+			coll = ((const DblinkFuncExpr *) expr)->funccollid;
+			break;
 		case T_NamedArgExpr:
 			coll = exprCollation((Node *) ((const NamedArgExpr *) expr)->arg);
 			break;
@@ -1160,6 +1168,9 @@ exprSetCollation(Node *expr, Oid collation)
 		case T_FuncExpr:
 			((FuncExpr *) expr)->funccollid = collation;
 			break;
+		case T_DblinkFuncExpr:
+			((DblinkFuncExpr *) expr)->funccollid = collation;
+			break;
 		case T_NamedArgExpr:
 			Assert(collation == exprCollation((Node *) ((NamedArgExpr *) expr)->arg));
 			break;
@@ -1437,6 +1448,17 @@ exprLocation(const Node *expr)
 				/* consider both function name and leftmost arg */
 				loc = leftmostLoc(fexpr->location,
 								  exprLocation((Node *) fexpr->args));
+			}
+			break;
+		case T_DblinkFuncExpr:
+			{
+				const DblinkFuncExpr *dfexpr = (const DblinkFuncExpr *) expr;
+				int			argloc = -1;
+
+				/* consider both routine name and leftmost arg */
+				if (dfexpr->args != NIL)
+					argloc = exprLocation((Node *) linitial(dfexpr->args));
+				loc = leftmostLoc(dfexpr->location, argloc);
 			}
 			break;
 		case T_NamedArgExpr:
@@ -2206,6 +2228,14 @@ expression_tree_walker_impl(Node *node,
 					return true;
 			}
 			break;
+		case T_DblinkFuncExpr:
+			{
+				DblinkFuncExpr *expr = (DblinkFuncExpr *) node;
+
+				if (LIST_WALK(expr->args))
+					return true;
+			}
+			break;
 		case T_NamedArgExpr:
 			return WALK(((NamedArgExpr *) node)->arg);
 		case T_OpExpr:
@@ -2839,6 +2869,9 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
 			if (WALK(rte->tablesample))
 				return true;
 			break;
+		case RTE_DBLINK:
+			/* nothing to do */
+			break;
 		case RTE_SUBQUERY:
 			if (!(flags & QTW_IGNORE_RT_SUBQUERIES))
 				if (WALK(rte->subquery))
@@ -3098,6 +3131,17 @@ expression_tree_mutator_impl(Node *node,
 
 				FLATCOPY(newnode, expr, FuncExpr);
 				MUTATE(newnode->args, expr->args, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_DblinkFuncExpr:
+			{
+				DblinkFuncExpr *expr = (DblinkFuncExpr *) node;
+				DblinkFuncExpr *newnode;
+
+				FLATCOPY(newnode, expr, DblinkFuncExpr);
+				MUTATE(newnode->args, expr->args, List *);
+				newnode->funcname = list_copy(expr->funcname);
 				return (Node *) newnode;
 			}
 			break;
@@ -3870,6 +3914,9 @@ range_table_mutator_impl(List *rtable,
 				MUTATE(newrte->tablesample, rte->tablesample,
 					   TableSampleClause *);
 				/* we don't bother to copy eref, aliases, etc; OK? */
+				break;
+			case RTE_DBLINK:
+				/* nothing to do */
 				break;
 			case RTE_SUBQUERY:
 				if (!(flags & QTW_IGNORE_RT_SUBQUERIES))

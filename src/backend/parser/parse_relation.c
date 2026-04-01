@@ -20,10 +20,14 @@
 #include "access/relation.h"
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "foreign/foreign.h"
+#include "foreign/fdwapi.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_enr.h"
@@ -1516,6 +1520,8 @@ addRangeTableEntry(ParseState *pstate,
 	LOCKMODE	lockmode;
 	Relation	rel;
 	ParseNamespaceItem *nsitem;
+	Oid		dblink_serverid = InvalidOid;
+	TupleDesc	dblink_tupdesc = NULL;
 
 	Assert(pstate != NULL);
 
@@ -1529,6 +1535,74 @@ addRangeTableEntry(ParseState *pstate,
 	 * AccessShareLock otherwise.
 	 */
 	lockmode = isLockedRefname(pstate, refname) ? RowShareLock : AccessShareLock;
+
+	/*
+	 * @dblink references are parsed into RangeVar.servername.
+	 * Build an RTE_DBLINK that carries remote identifiers and cached remote
+	 * column metadata; do not open/lock any local anchor relation.
+	 */
+	if (relation->servername != NULL)
+	{
+		const char *dblinkname = relation->servername;
+
+		dblink_serverid = get_dblink_server_oid(dblinkname, true);
+		if (!OidIsValid(dblink_serverid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("database link \"%s\" does not exist",
+							dblinkname),
+					 parser_errposition(pstate, relation->location)));
+
+		dblink_tupdesc = GetCachedDblinkTableMetadata(dblink_serverid,
+										 GetUserId(),
+										 relation->schemaname,
+									 relation->relname);
+		if (dblink_tupdesc == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("could not fetch remote metadata for database link \"%s\"",
+							dblinkname),
+					 parser_errposition(pstate, relation->location)));
+
+		rte->rtekind = RTE_DBLINK;
+		rte->eref = makeAlias(refname, NIL);
+		buildRelationAliases(dblink_tupdesc, alias, rte->eref);
+
+		rte->dblinkname = pstrdup(dblinkname);
+		rte->dblinknamespace = relation->schemaname ? pstrdup(relation->schemaname) : NULL;
+		rte->dblinkrelname = pstrdup(relation->relname);
+
+		{
+			List		*coltypes = NIL;
+			List		*coltypmods = NIL;
+			List		*colcollations = NIL;
+			int			attno;
+
+			// TODO: 有必要将将 TupleDesc 解包成三个列表吗？或者直接把 TupleDesc 存在 RTE 里，等需要的时候再解包？
+			for (attno = 1; attno <= dblink_tupdesc->natts; attno++)
+			{
+				Form_pg_attribute att = TupleDescAttr(dblink_tupdesc, attno - 1);
+
+				coltypes = lappend_oid(coltypes, att->atttypid);
+				coltypmods = lappend_int(coltypmods, att->atttypmod);
+				colcollations = lappend_oid(colcollations, att->attcollation);
+			}
+
+			rte->coltypes = coltypes;
+			rte->coltypmods = coltypmods;
+			rte->colcollations = colcollations;
+		}
+
+		rte->lateral = false;
+		rte->inFromCl = inFromCl;
+
+		pstate->p_rtable = lappend(pstate->p_rtable, rte);
+		nsitem = buildNSItemFromTupleDesc(rte, list_length(pstate->p_rtable),
+										  NULL,
+										  dblink_tupdesc);
+
+		return nsitem;
+	}
 
 	/*
 	 * Get the rel's OID.  This access also ensures that we have an up-to-date
@@ -1546,7 +1620,8 @@ addRangeTableEntry(ParseState *pstate,
 	 * and/or actual column names.
 	 */
 	rte->eref = makeAlias(refname, NIL);
-	buildRelationAliases(rel->rd_att, alias, rte->eref);
+	buildRelationAliases(rel->rd_att,
+						 alias, rte->eref);
 
 	/*
 	 * Set flags and initialize access permissions.
@@ -1572,7 +1647,8 @@ addRangeTableEntry(ParseState *pstate,
 	 * list --- caller must do that if appropriate.
 	 */
 	nsitem = buildNSItemFromTupleDesc(rte, list_length(pstate->p_rtable),
-									  perminfo, rel->rd_att);
+								  perminfo,
+							  rel->rd_att);
 
 	/*
 	 * Drop the rel refcount, but keep the access lock till end of transaction
@@ -2717,11 +2793,80 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 
 	switch (rte->rtekind)
 	{
+		case RTE_DBLINK:
 		case RTE_RELATION:
-			/* Ordinary relation RTE */
+			/* Relation or @dblink RTE */
+			if (rte->rtekind == RTE_DBLINK)
+			{
+				ListCell   *aliasp_item;
+				ListCell   *lct;
+				ListCell   *lcm;
+				ListCell   *lcc;
+
+				aliasp_item = colnames ? list_head(rte->eref->colnames) : NULL;
+				varattno = 0;
+				forthree(lct, rte->coltypes,
+						 lcm, rte->coltypmods,
+						 lcc, rte->colcollations)
+				{
+					Oid			coltype = lfirst_oid(lct);
+					int32		coltypmod = lfirst_int(lcm);
+					Oid			colcoll = lfirst_oid(lcc);
+
+					varattno++;
+
+					if (colnames)
+					{
+						/* Assume there is one alias per output column */
+						if (OidIsValid(coltype))
+						{
+							char	   *label;
+
+							if (!aliasp_item)
+								elog(ERROR, "too few column names for rangetable entry %s",
+									 rte->eref->aliasname);
+							label = strVal(lfirst(aliasp_item));
+							*colnames = lappend(*colnames,
+											makeString(pstrdup(label)));
+						}
+						else if (include_dropped)
+							*colnames = lappend(*colnames,
+											makeString(pstrdup("")));
+
+						aliasp_item = lnext(rte->eref->colnames, aliasp_item);
+					}
+
+					if (colvars)
+					{
+						if (OidIsValid(coltype))
+						{
+							Var		   *varnode;
+
+							varnode = makeVar(rtindex, varattno,
+										  coltype, coltypmod, colcoll,
+										  sublevels_up);
+							varnode->location = location;
+							*colvars = lappend(*colvars, varnode);
+						}
+						else if (include_dropped)
+						{
+							/*
+							 * It doesn't really matter what type the Const
+							 * claims to be.
+							 */
+							*colvars = lappend(*colvars,
+											makeNullConst(INT4OID, -1,
+														 InvalidOid));
+						}
+					}
+				}
+				break;
+			}
+
+			Assert(rte->rtekind == RTE_RELATION);
 			expandRelation(rte->relid, rte->eref,
-						   rtindex, sublevels_up, location,
-						   include_dropped, colnames, colvars);
+					   rtindex, sublevels_up, location,
+					   include_dropped, colnames, colvars);
 			break;
 		case RTE_SUBQUERY:
 			{
@@ -3317,7 +3462,9 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 	 * built (which can easily happen for rules).
 	 */
 	if (rte->rtekind == RTE_RELATION)
+	{
 		return get_attname(rte->relid, attnum, false);
+	}
 
 	/*
 	 * Otherwise use the column name from eref.  There should always be one.
@@ -3342,23 +3489,31 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 
 	switch (rte->rtekind)
 	{
+		case RTE_DBLINK:
+			{
+				/* Check dropped-ness by testing for valid coltype */
+				if (attnum <= 0 || attnum > list_length(rte->coltypes))
+					elog(ERROR, "invalid varattno %d", attnum);
+				result = !OidIsValid(list_nth_oid(rte->coltypes, attnum - 1));
+			}
+			break;
 		case RTE_RELATION:
 			{
-				/*
-				 * Plain relation RTE --- get the attribute's catalog entry
-				 */
-				HeapTuple	tp;
-				Form_pg_attribute att_tup;
+					/*
+					 * Plain relation RTE --- get the attribute's catalog entry
+					 */
+					HeapTuple	tp;
+					Form_pg_attribute att_tup;
 
-				tp = SearchSysCache2(ATTNUM,
-									 ObjectIdGetDatum(rte->relid),
-									 Int16GetDatum(attnum));
-				if (!HeapTupleIsValid(tp))	/* shouldn't happen */
-					elog(ERROR, "cache lookup failed for attribute %d of relation %u",
-						 attnum, rte->relid);
-				att_tup = (Form_pg_attribute) GETSTRUCT(tp);
-				result = att_tup->attisdropped;
-				ReleaseSysCache(tp);
+					tp = SearchSysCache2(ATTNUM,
+										 ObjectIdGetDatum(rte->relid),
+										 Int16GetDatum(attnum));
+					if (!HeapTupleIsValid(tp))	/* shouldn't happen */
+						elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+							 attnum, rte->relid);
+					att_tup = (Form_pg_attribute) GETSTRUCT(tp);
+					result = att_tup->attisdropped;
+					ReleaseSysCache(tp);
 			}
 			break;
 		case RTE_SUBQUERY:

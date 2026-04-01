@@ -16,9 +16,12 @@ SHLIB_LINK_INTERNAL = $(libpq)
 EXTENSION = postgres_fdw
 DATA = postgres_fdw--1.0.sql postgres_fdw--1.0--1.1.sql
 
-REGRESS = postgres_fdw query_cancel
+REGRESS = postgres_fdw database_link dblink_routine dblink_cache dblink_errors dblink_server_cache dblink_plpgsql query_cancel
 ISOLATION = eval_plan_qual
 ISOLATION_OPTS = --load-extension=postgres_fdw
+
+# Ensure required contrib extensions exist in the temp install.
+EXTRA_INSTALL += contrib/file_fdw
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

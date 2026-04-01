@@ -388,6 +388,7 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 			}
 			break;
 		case RTE_JOIN:
+		case RTE_DBLINK:
 		case RTE_FUNCTION:
 		case RTE_VALUES:
 		case RTE_TABLEFUNC:
@@ -1621,6 +1622,7 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 	switch (rte->rtekind)
 	{
 		case RTE_RELATION:
+		case RTE_DBLINK:
 		case RTE_VALUES:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:

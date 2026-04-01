@@ -1355,6 +1355,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 					child_rte->lateral = true;
 					break;
 				case RTE_JOIN:
+                case RTE_DBLINK:
 				case RTE_CTE:
 				case RTE_NAMEDTUPLESTORE:
 				case RTE_RESULT:
@@ -2418,6 +2419,7 @@ replace_vars_in_jointree(Node *jtnode,
 												context);
 						break;
 					case RTE_JOIN:
+                    case RTE_DBLINK:
 					case RTE_CTE:
 					case RTE_NAMEDTUPLESTORE:
 					case RTE_RESULT:

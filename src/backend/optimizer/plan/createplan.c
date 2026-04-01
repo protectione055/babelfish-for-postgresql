@@ -4143,10 +4143,15 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 	{
 		RangeTblEntry *rte;
 
-		Assert(rel->rtekind == RTE_RELATION);
 		rte = planner_rt_fetch(scan_relid, root);
-		Assert(rte->rtekind == RTE_RELATION);
-		rel_oid = rte->relid;
+		Assert(rte->rtekind == rel->rtekind);
+		if (rte->rtekind == RTE_RELATION)
+			rel_oid = rte->relid;
+		else
+		{
+			Assert(rte->rtekind == RTE_DBLINK);
+			rel_oid = InvalidOid;
+		}
 	}
 
 	/*

@@ -4332,7 +4332,7 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 	if (rte->rtekind == RTE_RELATION)
 	{
 		/* Relation --- look to the system catalogs for up-to-date info */
-		Relation	rel;
+		Relation		rel;
 		TupleDesc	tupdesc;
 
 		rel = relation_open(rte->relid, AccessShareLock);
@@ -7913,6 +7913,7 @@ get_name_for_var_field(Var *var, int fieldno,
 	switch (rte->rtekind)
 	{
 		case RTE_RELATION:
+		case RTE_DBLINK:
 		case RTE_VALUES:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
@@ -8591,6 +8592,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 		case T_WindowFunc:
 		case T_MergeSupportFunc:
 		case T_FuncExpr:
+		case T_DblinkFuncExpr:
 		case T_JsonConstructorExpr:
 		case T_JsonExpr:
 			/* function-like: name(..) or name[..] */
@@ -9083,6 +9085,33 @@ get_rule_expr(Node *node, deparse_context *context,
 
 		case T_FuncExpr:
 			get_func_expr((FuncExpr *) node, context, showimplicit);
+			break;
+
+		case T_DblinkFuncExpr:
+			{
+				DblinkFuncExpr *df = (DblinkFuncExpr *) node;
+				int			nameparts = list_length(df->funcname);
+
+				if (nameparts == 1)
+				{
+					appendStringInfoString(buf,
+										quote_identifier(strVal(linitial(df->funcname))));
+				}
+				else if (nameparts == 2)
+				{
+					appendStringInfo(buf, "%s.%s",
+								 quote_identifier(strVal(linitial(df->funcname))),
+								 quote_identifier(strVal(lsecond(df->funcname))));
+				}
+				else
+				{
+					elog(ERROR, "unexpected remote routine name length: %d", nameparts);
+				}
+
+				appendStringInfo(buf, "@%s(", quote_identifier(df->dblinkname));
+				get_rule_expr((Node *) df->args, context, showimplicit);
+				appendStringInfoChar(buf, ')');
+			}
 			break;
 
 		case T_NamedArgExpr:
@@ -12063,6 +12092,20 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 								 generate_relation_name(rte->relid,
 														context->namespaces));
 				break;
+			case RTE_DBLINK:
+				/* @dblink relation reference */
+				if (rte->dblinknamespace && rte->dblinknamespace[0] != '\0')
+					appendStringInfo(buf, "%s%s.%s@%s",
+								 only_marker(rte),
+								 quote_identifier(rte->dblinknamespace),
+								 quote_identifier(rte->dblinkrelname),
+								 quote_identifier(rte->dblinkname));
+				else
+					appendStringInfo(buf, "%s%s@%s",
+								 only_marker(rte),
+								 quote_identifier(rte->dblinkrelname),
+								 quote_identifier(rte->dblinkname));
+				break;
 			case RTE_SUBQUERY:
 				/* Subquery RTE */
 				appendStringInfoChar(buf, '(');
@@ -12355,6 +12398,15 @@ get_rte_alias(RangeTblEntry *rte, int varno, bool use_as,
 		 * conflict).
 		 */
 		if (strcmp(refname, get_relation_name(rte->relid)) != 0)
+			printalias = true;
+	}
+	else if (rte->rtekind == RTE_DBLINK)
+	{
+		/*
+		 * No local relid; compare against parser-assigned name to detect
+		 * conflict resolution by set_rtable_names.
+		 */
+		if (strcmp(refname, rte->eref->aliasname) != 0)
 			printalias = true;
 	}
 	else if (rte->rtekind == RTE_FUNCTION)

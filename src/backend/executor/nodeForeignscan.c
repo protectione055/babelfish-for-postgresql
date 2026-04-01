@@ -22,9 +22,12 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
 #include "executor/executor.h"
 #include "executor/nodeForeignscan.h"
 #include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
+#include "access/tupdesc.h"
 #include "utils/rel.h"
 
 static TupleTableSlot *ForeignNext(ForeignScanState *node);
@@ -65,7 +68,8 @@ ForeignNext(ForeignScanState *node)
 	 * Insert valid value into tableoid, the only actually-useful system
 	 * column.
 	 */
-	if (plan->fsSystemCol && !TupIsNull(slot))
+	if (plan->fsSystemCol && !TupIsNull(slot) &&
+		node->ss.ss_currentRelation != NULL)
 		slot->tts_tableOid = RelationGetRelid(node->ss.ss_currentRelation);
 
 	return slot;
@@ -146,6 +150,7 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	Index		scanrelid = node->scan.scanrelid;
 	int			tlistvarno;
 	FdwRoutine *fdwroutine;
+	RangeTblEntry *rte = NULL;
 
 	/* check for unsupported flags */
 	Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
@@ -171,9 +176,20 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	 */
 	if (scanrelid > 0)
 	{
-		currentRelation = ExecOpenScanRelation(estate, scanrelid, eflags);
-		scanstate->ss.ss_currentRelation = currentRelation;
-		fdwroutine = GetFdwRoutineForRelation(currentRelation, true);
+		rte = exec_rt_fetch(scanrelid, estate);
+		if (rte != NULL && rte->rtekind == RTE_DBLINK)
+		{
+			/* No local relcache entry for @dblink scans */
+			currentRelation = NULL;
+			scanstate->ss.ss_currentRelation = NULL;
+			fdwroutine = GetFdwRoutineByServerId(node->fs_server);
+		}
+		else
+		{
+			currentRelation = ExecOpenScanRelation(estate, scanrelid, eflags);
+			scanstate->ss.ss_currentRelation = currentRelation;
+			fdwroutine = GetFdwRoutineForRelation(currentRelation, true);
+		}
 	}
 	else
 	{
@@ -182,10 +198,12 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	}
 
 	/*
-	 * Determine the scan tuple type.  If the FDW provided a targetlist
-	 * describing the scan tuples, use that; else use base relation's rowtype.
+	 * Determine the scan tuple type.
+	 * If the FDW provided a targetlist describing the scan tuples, use that;
+	 * else use base relation's rowtype.  For @dblink scans (no local relation),
+	 * build the tupledesc from the RTE metadata/cache.
 	 */
-	if (node->fdw_scan_tlist != NIL || currentRelation == NULL)
+	if (node->fdw_scan_tlist != NIL)
 	{
 		TupleDesc	scan_tupdesc;
 
@@ -195,12 +213,103 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 		/* Node's targetlist will contain Vars with varno = INDEX_VAR */
 		tlistvarno = INDEX_VAR;
 	}
+	else if (currentRelation == NULL)
+	{
+		TupleDesc	scan_tupdesc = NULL;
+
+		/*
+		 * Join/upper ForeignScan nodes have no scanrelid.  If the FDW didn't
+		 * provide fdw_scan_tlist, fall back to the plan's targetlist.
+		 */
+		if (scanrelid == 0)
+		{
+			scan_tupdesc = ExecTypeFromTL(node->scan.plan.targetlist);
+			ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
+							  &TTSOpsHeapTuple);
+			/* Node's targetlist will contain Vars with varno = INDEX_VAR */
+			tlistvarno = INDEX_VAR;
+		}
+		else
+		{
+			int			colcount = 0;
+			bool		use_rte_desc = false;
+
+			if (rte == NULL)
+				rte = exec_rt_fetch(scanrelid, estate);
+			if (rte == NULL || rte->rtekind != RTE_DBLINK)
+				elog(ERROR, "foreign scan requires FDW scan targetlist");
+
+			/* don't trust FDWs to return tuples fulfilling NOT NULL constraints */
+			if (rte->eref != NULL && rte->eref->colnames != NIL)
+				colcount = list_length(rte->eref->colnames);
+			use_rte_desc = (colcount > 0 &&
+							colcount == list_length(rte->coltypes) &&
+							colcount == list_length(rte->coltypmods) &&
+							colcount == list_length(rte->colcollations) &&
+							!list_member_oid(rte->coltypes, InvalidOid));
+
+			if (use_rte_desc)
+				scan_tupdesc = BuildDescFromLists(rte->eref->colnames,
+								 rte->coltypes,
+								 rte->coltypmods,
+								 rte->colcollations);
+			else
+				scan_tupdesc = GetCachedDblinkTableMetadata(node->fs_server,
+									GetUserId(),
+									rte->dblinknamespace,
+									rte->dblinkrelname);
+
+			if (scan_tupdesc == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_TABLE),
+						 errmsg("could not fetch remote metadata for database link \"%s\"",
+								rte->dblinkname)));
+
+			ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
+							  &TTSOpsHeapTuple);
+			/* Node's targetlist will contain Vars with varno = scanrelid */
+			tlistvarno = scanrelid;
+		}
+	}
 	else
 	{
 		TupleDesc	scan_tupdesc;
+		RangeTblEntry *rte_local = exec_rt_fetch(scanrelid, estate);
 
 		/* don't trust FDWs to return tuples fulfilling NOT NULL constraints */
-		scan_tupdesc = CreateTupleDescCopy(RelationGetDescr(currentRelation));
+		if (rte_local && rte_local->dblinkname)
+		{
+			int			colcount = list_length(rte_local->eref->colnames);
+			bool		use_rte_desc = (colcount > 0 &&
+								colcount == list_length(rte_local->coltypes) &&
+								colcount == list_length(rte_local->coltypmods) &&
+								colcount == list_length(rte_local->colcollations) &&
+								!list_member_oid(rte_local->coltypes, InvalidOid));
+
+			if (use_rte_desc)
+				scan_tupdesc = BuildDescFromLists(rte_local->eref->colnames,
+									rte_local->coltypes,
+									rte_local->coltypmods,
+									rte_local->colcollations);
+			else
+			{
+				Oid		serverid;
+
+				serverid = GetForeignServerIdByRelId(RelationGetRelid(currentRelation));
+
+				scan_tupdesc = GetCachedDblinkTableMetadata(serverid,
+														GetUserId(),
+								rte_local->dblinknamespace,
+								rte_local->dblinkrelname);
+				if (scan_tupdesc == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_TABLE),
+							 errmsg("could not fetch remote metadata for database link \"%s\"",
+								rte_local->dblinkname)));
+			}
+		}
+		else
+			scan_tupdesc = CreateTupleDescCopy(RelationGetDescr(currentRelation));
 		ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
 							  &TTSOpsHeapTuple);
 		/* Node's targetlist will contain Vars with varno = scanrelid */

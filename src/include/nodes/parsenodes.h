@@ -1036,6 +1036,7 @@ typedef enum RTEKind
 	RTE_RESULT,					/* RTE represents an empty FROM clause; such
 								 * RTEs are added by the planner, they're not
 								 * present during parsing or rewriting */
+	RTE_DBLINK					/* @dblink remote object reference */
 } RTEKind;
 
 typedef struct RangeTblEntry
@@ -1251,6 +1252,15 @@ typedef struct RangeTblEntry
 	bool		inFromCl pg_node_attr(query_jumble_ignore);
 	/* security barrier quals to apply, if any */
 	List	   *securityQuals pg_node_attr(query_jumble_ignore);
+
+	/*
+	 * Append @dblink-specific fields after the historical common fields so
+	 * their offsets remain stable for extension code built against older
+	 * headers.
+	 */
+	char	   *dblinkname;
+	char	   *dblinknamespace;
+	char	   *dblinkrelname;
 } RangeTblEntry;
 
 /*
@@ -2286,6 +2296,7 @@ typedef enum ObjectType
 	OBJECT_DEFACL,
 	OBJECT_DOMAIN,
 	OBJECT_DOMCONSTRAINT,
+	OBJECT_DATABASELINK,
 	OBJECT_EVENT_TRIGGER,
 	OBJECT_EXTENSION,
 	OBJECT_FDW,
@@ -2950,6 +2961,35 @@ typedef struct DropUserMappingStmt
 } DropUserMappingStmt;
 
 /* ----------------------
+ *		Create/Drop DATABASE LINK Statements
+ * ----------------------
+ */
+
+typedef enum DbLinkSqlDialect
+{
+	DBLINK_DIALECT_PG = 0,
+	DBLINK_DIALECT_TSQL
+} DbLinkSqlDialect;
+
+typedef struct CreateDatabaseLinkStmt
+{
+	NodeTag		type;
+	char	   *dblinkname; 		/* database link name */
+	bool		if_not_exists;	/* just do nothing if it already exists? */
+	RoleSpec   *username;		/* CONNECT TO role, or CURRENT_USER */
+	char	   *password;		/* IDENTIFIED BY password, if provided */
+	char	   *connstr;		/* USING connection string */
+	DbLinkSqlDialect sql_dialect; /* explicit caller intent */
+} CreateDatabaseLinkStmt;
+
+typedef struct DropDatabaseLinkStmt
+{
+	NodeTag		type;
+	char	   *dblinkname;		/* database link name */
+	bool		missing_ok;		/* ignore missing link */
+} DropDatabaseLinkStmt;
+
+/* ----------------------
  *		Import Foreign Schema Statement
  * ----------------------
  */
@@ -3547,6 +3587,25 @@ typedef struct CallStmt
 	void 	   *retdesc; 		/* expected TupleDesc of the result rows */
 	void 	   *dest; 			/* DestReceiver to send the result rows */
 } CallStmt;
+
+/* ----------------------
+ *		Remote procedure execution statement (Babelfish linked servers, etc)
+ *
+ * Represents an EXEC/EXECUTE call to a remote stored procedure identified by
+ * a 4-part name: <server>.<database>.<schema>.<procedure>.
+ *
+ * The parser stores the remote identifier as a list of String nodes in
+ * remote_name, in that order.
+ * ----------------------
+ */
+typedef struct RemoteProcStmt
+{
+	NodeTag		type;
+	List	   *remote_name;		/* 4-part proc name: server, db, schema, proc */
+	List	   *args;				/* raw argument list (NamedArgExpr/Expr, etc) */
+	Node	   *return_var;		/* optional return status target (e.g. @rc=) */
+	ParseLoc	location;
+} RemoteProcStmt;
 
 typedef struct CallContext
 {

@@ -28,13 +28,16 @@
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
 #include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/value.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
@@ -679,6 +682,80 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 			root->fkey_list = lappend(root->fkey_list, info);
 		}
 	}
+}
+
+void
+get_dblink_relation_info(PlannerInfo *root, RangeTblEntry *rte, RelOptInfo *rel)
+{
+	int			attno;
+	Oid			serverid;
+	int			colcount;
+
+	(void) root;
+
+	if (rte->dblinkname == NULL)
+		elog(ERROR, "RTE_DBLINK is missing database link name");
+
+	if (rte->eref == NULL || rte->eref->colnames == NIL)
+		elog(ERROR, "RTE_DBLINK is missing cached column names");
+
+	if (rte->coltypes == NIL || rte->coltypmods == NIL ||
+		rte->colcollations == NIL)
+		elog(ERROR, "RTE_DBLINK is missing cached column metadata");
+
+	colcount = list_length(rte->coltypes);
+	if (colcount != list_length(rte->coltypmods) ||
+		colcount != list_length(rte->colcollations) ||
+		colcount != list_length(rte->eref->colnames))
+		elog(ERROR, "RTE_DBLINK has inconsistent cached column metadata");
+
+	serverid = get_dblink_server_oid(rte->dblinkname, true);
+	if (!OidIsValid(serverid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database link \"%s\" does not exist",
+					rte->dblinkname)));
+
+	/*
+	 * Set up rel attribute arrays.
+	 * Note: include system-column slots to match ordinary relation handling.
+	 */
+	rel->min_attr = FirstLowInvalidHeapAttributeNumber + 1;
+	rel->max_attr = colcount;
+	rel->reltablespace = InvalidOid;
+
+	Assert(rel->max_attr >= rel->min_attr);
+	rel->attr_needed = (Relids *)
+		palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(Relids));
+	rel->attr_widths = (int32 *)
+		palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(int32));
+
+	attno = 1;
+	{
+		ListCell   *lc_type;
+		ListCell   *lc_typmod;
+
+		forboth(lc_type, rte->coltypes, lc_typmod, rte->coltypmods)
+		{
+			Oid		typid = lfirst_oid(lc_type);
+			int32	typmod = lfirst_int(lc_typmod);
+
+			rel->attr_widths[attno - rel->min_attr] =
+				get_typavgwidth(typid, typmod);
+			attno++;
+		}
+	}
+
+	rel->rel_parallel_workers = 0;
+	rel->pages = 0;
+	rel->tuples = 0;
+	rel->allvisfrac = 0;
+	rel->indexlist = NIL;
+	rel->statlist = NIL;
+	rel->notnullattnums = NULL;
+
+	rel->serverid = serverid;
+	rel->fdwroutine = GetFdwRoutineByServerId(serverid);
 }
 
 /*
@@ -1781,38 +1858,78 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 
 	switch (rte->rtekind)
 	{
+		case RTE_DBLINK:
 		case RTE_RELATION:
-			/* Assume we already have adequate lock */
-			relation = table_open(rte->relid, NoLock);
+				if (rte->rtekind == RTE_DBLINK)
+				{
+					ListCell   *lc_type;
+					ListCell   *lc_typmod;
+					ListCell   *lc_coll;
 
-			numattrs = RelationGetNumberOfAttributes(relation);
-			for (attrno = 1; attrno <= numattrs; attrno++)
-			{
-				Form_pg_attribute att_tup = TupleDescAttr(relation->rd_att,
+					numattrs = list_length(rte->coltypes);
+					for (attrno = 1,
+						 lc_type = list_head(rte->coltypes),
+						 lc_typmod = list_head(rte->coltypmods),
+						 lc_coll = list_head(rte->colcollations);
+						 attrno <= numattrs && lc_type != NULL;
+						 attrno++,
+						 lc_type = lnext(rte->coltypes, lc_type),
+						 lc_typmod = lc_typmod ? lnext(rte->coltypmods, lc_typmod) : NULL,
+						 lc_coll = lc_coll ? lnext(rte->colcollations, lc_coll) : NULL)
+					{
+						Oid		typid = lfirst_oid(lc_type);
+						int32	typmod = lc_typmod ? lfirst_int(lc_typmod) : -1;
+						Oid		coll = lc_coll ? lfirst_oid(lc_coll) : InvalidOid;
+
+						var = makeVar(varno,
+										  attrno,
+										  typid,
+										  typmod,
+										  coll,
+										  0);
+
+						tlist = lappend(tlist,
+										makeTargetEntry((Expr *) var,
+																attrno,
+																NULL,
+																false));
+					}
+				}
+				else
+				{
+					Assert(rte->rtekind == RTE_RELATION);
+					/* Assume we already have adequate lock */
+					relation = table_open(rte->relid, NoLock);
+
+					numattrs = RelationGetNumberOfAttributes(relation);
+					for (attrno = 1; attrno <= numattrs; attrno++)
+					{
+						Form_pg_attribute att_tup = TupleDescAttr(relation->rd_att,
 														  attrno - 1);
 
-				if (att_tup->attisdropped || att_tup->atthasmissing)
-				{
-					/* found a dropped or missing col, so punt */
-					tlist = NIL;
-					break;
+						if (att_tup->attisdropped || att_tup->atthasmissing)
+						{
+							/* found a dropped or missing col, so punt */
+							tlist = NIL;
+							break;
+						}
+
+						var = makeVar(varno,
+										  attrno,
+										  att_tup->atttypid,
+										  att_tup->atttypmod,
+										  att_tup->attcollation,
+										  0);
+
+						tlist = lappend(tlist,
+										makeTargetEntry((Expr *) var,
+																attrno,
+																NULL,
+																false));
+					}
+
+					table_close(relation, NoLock);
 				}
-
-				var = makeVar(varno,
-							  attrno,
-							  att_tup->atttypid,
-							  att_tup->atttypmod,
-							  att_tup->attcollation,
-							  0);
-
-				tlist = lappend(tlist,
-								makeTargetEntry((Expr *) var,
-												attrno,
-												NULL,
-												false));
-			}
-
-			table_close(relation, NoLock);
 			break;
 
 		case RTE_SUBQUERY:
