@@ -21,6 +21,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
@@ -56,8 +57,15 @@
 #include "commands/user.h"
 #include "commands/vacuum.h"
 #include "commands/view.h"
+#include "executor/executor.h"
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
+#include "foreign/remoteproc_var.h"
+#include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "parser/parser.h"
+#include "parser/parse_expr.h"
 #include "parser/parse_utilcmd.h"
 #include "postmaster/bgwriter.h"
 #include "rewrite/rewriteDefine.h"
@@ -66,11 +74,15 @@
 #include "utils/acl.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 /* Hook for plugins to get control in ProcessUtility() */
 ProcessUtility_hook_type ProcessUtility_hook = NULL;
 bbfCustomProcessUtility_hook_type bbfCustomProcessUtility_hook = NULL;
 bbfSelectIntoUtility_hook_type bbfSelectIntoUtility_hook = NULL;
+remote_proc_pre_exec_auth_hook_type remote_proc_pre_exec_auth_hook = NULL;
+remote_proc_result_set_boundary_hook_type remote_proc_result_set_boundary_hook = NULL;
+remote_proc_return_status_hook_type remote_proc_return_status_hook = NULL;
 
 /* local function declarations */
 static int	ClassifyUtilityCommandAsReadOnly(Node *parsetree);
@@ -83,6 +95,139 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+static void ExecuteRemoteProcStmt(ParseState *parent_pstate,
+								  const char *queryString,
+								  RemoteProcStmt *stmt,
+								  ParamListInfo params,
+								  bool atomic,
+								  DestReceiver *dest);
+static RemoteProcVarHook *GetRemoteProcVarHook(void);
+static Node *DeconstructRemoteProcArg(Node *raw_arg,
+								   char **argname,
+								   bool *is_output_arg);
+static char *GetRemoteProcArgVarName(Node *raw_arg);
+static bool ResolveRemoteProcHookVar(RemoteProcVarHook *varhook,
+							 const char *varname,
+							 Oid *vartype,
+							 int32 *vartypmod,
+							 Datum *value,
+							 bool *isnull,
+							 void **varref);
+
+/*
+ * RemoteProcVarBinding
+ *
+ * Associates one remote-procedure argument with a caller-side variable
+ * reference for OUTPUT assignment.
+ *
+ * During ExecuteRemoteProcStmt(), OUTPUT arguments that resolve to local
+ * T-SQL variables are recorded as bindings.  After the FDW returns output
+ * values, we match by arg_index and assign the value back through varref.
+ *
+ * arg_index: 0-based ordinal in RemoteProcStmt->args.
+ * varref: opaque variable handle provided by RemoteProcVarHook callbacks.
+ */
+typedef struct RemoteProcVarBinding
+{
+	int			arg_index;
+	void	   *varref;
+} RemoteProcVarBinding;
+
+static bool
+ResolveRemoteProcHookVar(RemoteProcVarHook *varhook,
+						 const char *varname,
+						 Oid *vartype,
+						 int32 *vartypmod,
+						 Datum *value,
+						 bool *isnull,
+						 void **varref)
+{
+	char   *prefixed_name;
+	bool	resolved;
+
+	if (varhook == NULL || varhook->resolve_var == NULL ||
+		varname == NULL || varname[0] == '\0')
+		return false;
+
+	resolved = varhook->resolve_var(varname,
+								vartype,
+								vartypmod,
+								value,
+								isnull,
+								varref);
+	if (resolved || varname[0] == '@')
+		return resolved;
+
+	/*
+	 * Some callers expose variable names with or without a leading marker.
+	 * Retry with the alternate form so OUTPUT and return-status targets share
+	 * the same lookup path.
+	 */
+	prefixed_name = psprintf("@%s", varname);
+	resolved = varhook->resolve_var(prefixed_name,
+								vartype,
+								vartypmod,
+								value,
+								isnull,
+								varref);
+	pfree(prefixed_name);
+
+	return resolved;
+}
+
+/*
+ * RemoteProcStmt arguments may use NamedArgExpr for two different cases:
+ * ordinary named arguments and the anonymous wrapper we use to preserve
+ * positional OUTPUT metadata.  Normalize both forms here so the executor
+ * sees one underlying expression plus separate name/direction metadata.
+ */
+static Node *
+DeconstructRemoteProcArg(Node *raw_arg, char **argname, bool *is_output_arg)
+{
+	if (argname != NULL)
+		*argname = NULL;
+	if (is_output_arg != NULL)
+		*is_output_arg = false;
+
+	if (IsA(raw_arg, NamedArgExpr))
+	{
+		NamedArgExpr *named = castNode(NamedArgExpr, raw_arg);
+
+		if (argname != NULL && named->name != NULL)
+			*argname = named->name;
+		if (is_output_arg != NULL)
+			*is_output_arg = (named->argnumber == -2);
+		return (Node *) named->arg;
+	}
+
+	return raw_arg;
+}
+
+/* TODO: 变量名的解析应该放到兼容层插件
+ * Only bare @var references can be rebound through remote_proc_var_hook.
+ * More complex expressions must go through normal transform/evaluation.
+ */
+static char *
+GetRemoteProcArgVarName(Node *raw_arg)
+{
+	ColumnRef  *cref;
+	Node	   *field;
+
+	if (!IsA(raw_arg, ColumnRef))
+		return NULL;
+
+	cref = castNode(ColumnRef, raw_arg);
+	if (list_length(cref->fields) != 1)
+		return NULL;
+
+	field = (Node *) linitial(cref->fields);
+	if (!IsA(field, String))
+		return NULL;
+	if (strVal(field)[0] != '@')
+		return NULL;
+
+	return strVal(field);
+}
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -174,6 +319,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_CreateEventTrigStmt:
 		case T_CreateExtensionStmt:
 		case T_CreateFdwStmt:
+		case T_CreateDatabaseLinkStmt:
 		case T_CreateForeignServerStmt:
 		case T_CreateForeignTableStmt:
 		case T_CreateFunctionStmt:
@@ -201,6 +347,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_DropStmt:
 		case T_DropSubscriptionStmt:
 		case T_DropTableSpaceStmt:
+		case T_DropDatabaseLinkStmt:
 		case T_DropUserMappingStmt:
 		case T_DropdbStmt:
 		case T_GrantRoleStmt:
@@ -236,6 +383,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 
 		case T_CallStmt:
 		case T_DoStmt:
+		case T_RemoteProcStmt:
 			{
 				/*
 				 * Commands inside the DO block or the called procedure might
@@ -866,6 +1014,15 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_CallStmt:
 			ExecuteCallStmt(castNode(CallStmt, parsetree), params, isAtomicContext, dest);
+			break;
+
+		case T_RemoteProcStmt:
+			ExecuteRemoteProcStmt(pstate,
+							  queryString,
+							  castNode(RemoteProcStmt, parsetree),
+							  params,
+							  isAtomicContext,
+							  dest);
 			break;
 
 		case T_ClusterStmt:
@@ -1620,6 +1777,10 @@ ProcessUtilitySlow(ParseState *pstate,
 				address = CreateUserMapping((CreateUserMappingStmt *) parsetree);
 				break;
 
+			case T_CreateDatabaseLinkStmt:
+				address = CreateDatabaseLink((CreateDatabaseLinkStmt *) parsetree);
+				break;
+
 			case T_AlterUserMappingStmt:
 				address = AlterUserMapping((AlterUserMappingStmt *) parsetree);
 				break;
@@ -1628,6 +1789,10 @@ ProcessUtilitySlow(ParseState *pstate,
 				RemoveUserMapping((DropUserMappingStmt *) parsetree);
 				/* no commands stashed for DROP */
 				commandCollected = true;
+				break;
+
+			case T_DropDatabaseLinkStmt:
+				address = DropDatabaseLink((DropDatabaseLinkStmt *) parsetree);
 				break;
 
 			case T_ImportForeignSchemaStmt:
@@ -2033,6 +2198,382 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 			RemoveObjects(stmt);
 			break;
 	}
+}
+
+/*
+ * ExecuteRemoteProcStmt
+ *
+ * Execute a 4-part remote procedure call through the linked-server FDW API.
+ *
+ * This routine is the utility-layer bridge from RemoteProcStmt to FDW remote
+ * procedure callbacks.  It performs the following steps:
+ *
+ * 1) Resolve linked-server metadata from pg_dblink.
+ * 2) Invoke optional pre-execution authorization hook.
+ * 3) Verify FDW callback availability.
+ * 4) Transform/evaluate input arguments in utility context.
+ * 5) Invoke ExecRemoteProc() and stream each visible result set to dest.
+ * 6) Apply OUTPUT values back to local variables via remote_proc_var_hook.
+ *
+ * parent_pstate: parent ParseState for argument transformation context.
+ * queryString: source SQL text for diagnostics/transform hooks.
+ * stmt: parsed remote procedure statement.
+ * params: parameter state for transform/eval; can be NULL in utility paths.
+ * atomic: whether the caller runs atomically (snapshot handling differs).
+ * dest: destination receiver for tabular results (if any).
+ */
+static void
+ExecuteRemoteProcStmt(ParseState *parent_pstate,
+					  const char *queryString,
+					  RemoteProcStmt *stmt,
+					  ParamListInfo params,
+					  bool atomic,
+					  DestReceiver *dest)
+{
+	char	   *dblinkname;
+	char	   *remote_database;
+	char	   *remote_schema;
+	char	   *remote_routine;
+	Oid			serverid;
+	Oid			userid = GetUserId();
+	FdwRoutine *fdw;
+	void	   *handle;
+	TupleDesc	result_desc;
+	TupleTableSlot *slot;
+	int			nargs;
+	const char **argnames;
+	Oid	   *argtypes;
+	int32	  *argtypmods;
+	Datum	   *argvalues;
+	bool	   *argnulls;
+	bool	   *argisout;
+	ParseState *pstate;
+	EState	   *estate;
+	ExprContext *econtext;
+	RemoteProcVarHook *varhook;
+	List	   *varbindings = NIL;
+	void	   *return_varref = NULL;
+	List	   *outputs;
+	ListCell   *lc;
+	int			argno;
+
+	/*
+	 * Validate and split 4-part remote name:
+	 *   server.database.schema.routine
+	 */
+	if (stmt->remote_name == NIL || list_length(stmt->remote_name) != 4)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("remote procedure name must be 4-part identifier")));
+
+	dblinkname = strVal(linitial(stmt->remote_name));
+	remote_database = strVal(lsecond(stmt->remote_name));
+	remote_schema = strVal(lthird(stmt->remote_name));
+	remote_routine = strVal(lfourth(stmt->remote_name));
+
+	serverid = get_dblink_server_oid(dblinkname, true);
+	if (!OidIsValid(serverid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("linked server \"%s\" does not exist", dblinkname)));
+
+	/*
+	 * Let compatibility layers enforce surface-specific authorization policy
+	 * before any FDW remote-proc callback is invoked.
+	 */
+	if (remote_proc_pre_exec_auth_hook != NULL)
+		remote_proc_pre_exec_auth_hook(userid, dblinkname, serverid, stmt);
+
+	/* Validate required FDW remote-proc callback contract. */
+	fdw = GetFdwRoutineByServerId(serverid);
+	if (fdw->ExecRemoteProc == NULL ||
+		fdw->FetchRemoteProcResult == NULL ||
+		fdw->GetRemoteProcOutputs == NULL ||
+		fdw->RemoteProcHasMoreResults == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("FDW does not support remote procedure execution")));
+
+	nargs = list_length(stmt->args);
+	argnames = (const char **) palloc0(sizeof(char *) * Max(nargs, 1));
+	argtypes = (Oid *) palloc0(sizeof(Oid) * Max(nargs, 1));
+	argtypmods = (int32 *) palloc0(sizeof(int32) * Max(nargs, 1));
+	argvalues = (Datum *) palloc0(sizeof(Datum) * Max(nargs, 1));
+	argnulls = (bool *) palloc0(sizeof(bool) * Max(nargs, 1));
+	argisout = (bool *) palloc0(sizeof(bool) * Max(nargs, 1));
+	varhook = GetRemoteProcVarHook();
+
+	if (stmt->return_var != NULL && IsA(stmt->return_var, ColumnRef) &&
+		varhook != NULL && varhook->resolve_var != NULL)
+	{
+		ColumnRef  *cref = castNode(ColumnRef, stmt->return_var);
+		Node	   *field;
+		Oid			vartype = InvalidOid;
+		int32		vartypmod = -1;
+		Datum		value = (Datum) 0;
+		bool		isnull = true;
+
+		if (list_length(cref->fields) == 1)
+		{
+			field = (Node *) linitial(cref->fields);
+			if (IsA(field, String))
+			{
+				(void) ResolveRemoteProcHookVar(varhook,
+									 strVal(field),
+									 &vartype,
+									 &vartypmod,
+									 &value,
+									 &isnull,
+									 &return_varref);
+				if (!isnull && vartype != InvalidOid)
+				{
+					int16		typlen;
+					bool		typbyval;
+
+					get_typlenbyval(vartype, &typlen, &typbyval);
+					if (!typbyval)
+						pfree(DatumGetPointer(value));
+				}
+			}
+		}
+	}
+
+	/* Build transform/evaluation context for remote-call arguments. */
+	pstate = make_parsestate(parent_pstate);
+	pstate->p_sourcetext = queryString;
+	if (params != NULL && params->parserSetup != NULL)
+		params->parserSetup(pstate, params->parserSetupArg);
+	estate = CreateExecutorState();
+	estate->es_param_list_info = params;
+	econtext = CreateExprContext(estate);
+
+	/* Non-atomic utility execution needs an explicit active snapshot. */
+	if (!atomic)
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+	/*
+	 * Transform/evaluate each argument and capture type/value/null metadata.
+	 * For local variable refs in utility paths with params == NULL, resolve
+	 * them through the rendezvous var hook so T-SQL @vars are not treated as
+	 * SQL column references when parser hooks are unavailable.
+	 */
+	argno = 0;
+	foreach(lc, stmt->args)
+	{
+		Node	   *raw_arg = (Node *) lfirst(lc);
+		char	   *argname = NULL;
+		char	   *varname;
+		Node	   *transformed_arg;
+		ExprState  *exprstate;
+		Datum		val;
+		bool		isnull;
+		bool		is_output_arg = false;
+
+		raw_arg = DeconstructRemoteProcArg(raw_arg, &argname, &is_output_arg);
+		if (argname != NULL)
+			argnames[argno] = pstrdup(argname);
+
+		argisout[argno] = is_output_arg;
+		varname = GetRemoteProcArgVarName(raw_arg);
+
+		/*
+		 * Utility execution can arrive here without parser hooks, so a bare T-SQL
+		 * variable reference such as @x would otherwise be parsed as a SQL column.
+		 * Resolve the variable eagerly through the Babelfish rendezvous hook.
+		 */
+		if (params == NULL && varname != NULL)
+		{
+			if (varhook && varhook->resolve_var)
+			{
+				void	   *varref = NULL;
+
+				if (ResolveRemoteProcHookVar(varhook,
+								 varname,
+								 &argtypes[argno],
+								 &argtypmods[argno],
+								 &argvalues[argno],
+								 &argnulls[argno],
+								 is_output_arg ? &varref : NULL))
+				{
+					if (is_output_arg)
+					{
+						RemoteProcVarBinding *binding = palloc0(sizeof(RemoteProcVarBinding));
+
+						binding->arg_index = argno;
+						binding->varref = varref;
+						varbindings = lappend(varbindings, binding);
+					}
+
+					argno++;
+					continue;
+				}
+			}
+
+			if (is_output_arg)
+			{
+				argtypes[argno] = UNKNOWNOID;
+				argtypmods[argno] = -1;
+				argvalues[argno] = (Datum) 0;
+				argnulls[argno] = true;
+				argno++;
+				continue;
+			}
+		}
+
+		transformed_arg = transformExpr(pstate, raw_arg, EXPR_KIND_CALL_ARGUMENT);
+		exprstate = ExecPrepareExpr((Expr *) transformed_arg, estate);
+		val = ExecEvalExprSwitchContext(exprstate, econtext, &isnull);
+
+		argtypes[argno] = exprType(transformed_arg);
+		argtypmods[argno] = exprTypmod(transformed_arg);
+		argvalues[argno] = val;
+		argnulls[argno] = isnull;
+		argno++;
+	}
+
+	if (!atomic)
+		PopActiveSnapshot();
+
+	result_desc = NULL;
+
+	/* Invoke the FDW remote procedure entry point. */
+	handle = fdw->ExecRemoteProc(serverid,
+								userid,
+								remote_database,
+								remote_schema,
+								remote_routine,
+								nargs,
+								argnames,
+								argtypes,
+								argisout,
+								argvalues,
+								argnulls,
+								/*
+								* return_var only reflects whether the local statement had a
+								* caller-visible return-status target (for example,
+								* EXEC @rc = ...).  Protocol-level return status may still
+								* need to be harvested even when no such local target exists.
+								*/
+								(stmt->return_var != NULL || remote_proc_return_status_hook != NULL));
+
+	if (fdw->GetRemoteProcRuntimeResultDesc != NULL)
+		result_desc = fdw->GetRemoteProcRuntimeResultDesc(handle);
+
+	/* Stream each visible remote result set as a separate client-visible rowset. */
+	while (result_desc)
+	{
+		uint64		result_rowcount = 0;
+
+		if (dest && dest->rStartup)
+			dest->rStartup(dest, CMD_SELECT, result_desc);
+
+		slot = MakeSingleTupleTableSlot(result_desc, &TTSOpsMinimalTuple);
+		while (fdw->FetchRemoteProcResult(handle, slot))
+		{
+			dest->receiveSlot(slot, dest);
+			result_rowcount++;
+			ExecClearTuple(slot);
+		}
+		ExecDropSingleTupleTableSlot(slot);
+
+		if (dest && dest->rShutdown)
+			dest->rShutdown(dest);
+
+		if (!fdw->RemoteProcHasMoreResults(handle))
+		{
+			result_desc = NULL;
+			break;
+		}
+
+		/*
+		 * Notify external layers about the completed visible rowset before the
+		 * next one is exposed. The hook stays protocol-agnostic here.
+		 */
+		if (remote_proc_result_set_boundary_hook != NULL)
+			remote_proc_result_set_boundary_hook(result_rowcount);
+
+		if (fdw->GetRemoteProcRuntimeResultDesc == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("FDW reported an additional remote procedure result set without a runtime descriptor")));
+
+		result_desc = fdw->GetRemoteProcRuntimeResultDesc(handle);
+		if (result_desc == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("FDW failed to describe an additional remote procedure result set")));
+	}
+
+	outputs = fdw->GetRemoteProcOutputs(handle);
+
+	/* Map OUTPUT values back into caller-visible variables when available. */
+	if (outputs != NIL && varhook && varhook->assign_var)
+	{
+		ListCell   *oc;
+
+		foreach(oc, outputs)
+		{
+			RemoteProcOutputValue *out = (RemoteProcOutputValue *) lfirst(oc);
+			ListCell   *bc;
+
+			if (out == NULL)
+				continue;
+
+			if (out->is_return_status)
+			{
+				/* Publish the final RPC status before optional local assignment. */
+				if (remote_proc_return_status_hook != NULL)
+					remote_proc_return_status_hook(DatumGetInt32(out->value),
+											 out->isnull);
+
+				if (return_varref != NULL)
+					(void) varhook->assign_var(return_varref,
+										 out->valtype,
+										 out->valtypmod,
+										 out->value,
+										 out->isnull);
+				continue;
+			}
+
+			if (out->arg_index < 0 || out->arg_index >= nargs)
+				continue;
+			if (!argisout[out->arg_index])
+				continue;
+
+			foreach(bc, varbindings)
+			{
+				RemoteProcVarBinding *binding = (RemoteProcVarBinding *) lfirst(bc);
+
+				if (binding->arg_index != out->arg_index || binding->varref == NULL)
+					continue;
+
+				(void) varhook->assign_var(binding->varref,
+											 out->valtype,
+											 out->valtypmod,
+											 out->value,
+											 out->isnull);
+				break;
+			}
+		}
+	}
+
+	/* Tear down per-call expression/parse state. */
+	FreeExecutorState(estate);
+	free_parsestate(pstate);
+}
+
+static RemoteProcVarHook *
+GetRemoteProcVarHook(void)
+{
+	static RemoteProcVarHook **hookptr = NULL;
+
+	if (hookptr == NULL)
+		hookptr = (RemoteProcVarHook **) find_rendezvous_variable("remote_proc_var_hook");
+
+	if (hookptr == NULL)
+		return NULL;
+
+	return *hookptr;
 }
 
 
@@ -2836,6 +3377,10 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_SEQUENCE;
 			break;
 
+		case T_CreateDatabaseLinkStmt:
+			tag = CMDTAG_CREATE_DATABASE_LINK;
+			break;
+
 		case T_AlterSeqStmt:
 			tag = CMDTAG_ALTER_SEQUENCE;
 			break;
@@ -2858,6 +3403,10 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_DROP_DATABASE;
 			break;
 
+		case T_DropDatabaseLinkStmt:
+			tag = CMDTAG_DROP_DATABASE_LINK;
+			break;
+
 		case T_NotifyStmt:
 			tag = CMDTAG_NOTIFY;
 			break;
@@ -2875,6 +3424,10 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 		case T_CallStmt:
+			tag = CMDTAG_CALL;
+			break;
+
+		case T_RemoteProcStmt:
 			tag = CMDTAG_CALL;
 			break;
 
@@ -3317,6 +3870,10 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_DDL;
 			break;
 
+		case T_CreateDatabaseLinkStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
 		case T_CreateStmt:
 		case T_CreateForeignTableStmt:
 			lev = LOGSTMT_DDL;
@@ -3506,6 +4063,10 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_DDL;
 			break;
 
+		case T_DropDatabaseLinkStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
 		case T_NotifyStmt:
 			lev = LOGSTMT_ALL;
 			break;
@@ -3523,6 +4084,10 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_CallStmt:
+			lev = LOGSTMT_ALL;
+			break;
+
+		case T_RemoteProcStmt:
 			lev = LOGSTMT_ALL;
 			break;
 

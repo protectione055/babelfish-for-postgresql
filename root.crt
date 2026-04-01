@@ -1,0 +1,54 @@
+Certificate:
+    Data:
+        Version: 1 (0x0)
+        Serial Number:
+            72:f3:ef:47:e4:62:e3:a5:50:63:cc:4e:17:69:cf:7e:48:15:98:91
+        Signature Algorithm: NULL
+        Issuer: CN = ironmanzzm.top
+        Validity
+            Not Before: Feb  9 10:27:04 2026 GMT
+            Not After : Feb  7 10:27:04 2036 GMT
+        Subject: CN = ironmanzzm.top
+        Subject Public Key Info:
+            Public Key Algorithm: rsaEncryption
+                RSA Public-Key: (2048 bit)
+                Modulus:
+                    00:b8:d8:25:4c:2d:67:59:57:17:4c:9f:79:70:05:
+                    a6:d6:b9:e9:ba:dd:fd:aa:d1:a3:cd:aa:82:18:87:
+                    bf:65:e6:4b:fb:cb:79:26:cb:60:f2:ec:92:99:09:
+                    e9:cd:53:72:30:a3:c9:d5:ca:ae:e8:c3:e5:25:e6:
+                    6d:86:7c:a4:69:15:49:72:75:1c:87:78:49:a4:14:
+                    be:84:88:6b:cb:86:fd:90:4e:6c:a6:f5:7f:d0:3a:
+                    8a:2d:36:2f:3c:85:f4:e9:65:27:32:72:79:cd:47:
+                    7a:a8:97:a5:70:c8:4f:d8:d5:0c:70:5c:7c:f1:7c:
+                    3b:fd:9a:8a:03:ce:ed:46:40:1c:65:bb:be:23:4c:
+                    ac:05:d0:0c:c5:83:1c:7b:99:ef:c9:47:10:ca:5d:
+                    98:94:a4:ca:bb:2e:e8:5c:bf:a6:2d:48:90:bf:f5:
+                    70:89:fb:b9:c9:a9:cd:83:72:89:4d:47:81:bf:1c:
+                    82:3e:cc:9b:e2:95:72:97:1d:4d:7f:48:d7:3c:92:
+                    d5:74:80:72:29:84:ff:99:a0:cd:92:a9:e5:f0:2e:
+                    80:7f:a5:aa:c8:f9:1d:41:bd:94:8b:c7:47:cf:7e:
+                    49:61:19:90:b5:b7:43:cc:63:6c:da:b6:87:84:58:
+                    2c:d7:12:b6:8b:46:9b:ba:e2:e1:7e:20:dc:b9:f1:
+                    18:c3
+                Exponent: 65537 (0x10001)
+    Signature Algorithm: NULL
+-----BEGIN CERTIFICATE-----
+MIIDEzCCAfugAwIBAgIUcvPvR+Ri46VQY8xOF2nPfkgVmJEwDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOaXJvbm1hbnp6bS50b3AwHhcNMjYwMjA5MTAyNzA0WhcN
+MzYwMjA3MTAyNzA0WjAZMRcwFQYDVQQDDA5pcm9ubWFuenptLnRvcDCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBALjYJUwtZ1lXF0yfeXAFpta56brd/arR
+o82qghiHv2XmS/vLeSbLYPLskpkJ6c1TcjCjydXKrujD5SXmbYZ8pGkVSXJ1HId4
+SaQUvoSIa8uG/ZBObKb1f9A6ii02LzyF9OllJzJyec1HeqiXpXDIT9jVDHBcfPF8
+O/2aigPO7UZAHGW7viNMrAXQDMWDHHuZ78lHEMpdmJSkyrsu6Fy/pi1IkL/1cIn7
+ucmpzYNyiU1Hgb8cgj7Mm+KVcpcdTX9I1zyS1XSAcimE/5mgzZKp5fAugH+lqsj5
+HUG9lIvHR89+SWEZkLW3Q8xjbNq2h4RYLNcStotGm7ri4X4g3LnxGMMCAwEAAaNT
+MFEwHQYDVR0OBBYEFC49/ZOWIcC+uyKAg9k35oZ15BRKMB8GA1UdIwQYMBaAFC49
+/ZOWIcC+uyKAg9k35oZ15BRKMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBAHO9QKAU7H8RPITw4i3v4/Ci77vv/H+fBNYKiY6RT1Tx67euqNx0MGkS
+8gWgmr0EUr29VoeWmjexAtufDqzC6BcA3G+B3c9CyxCHsASZkeehFBMx3oTpZA0F
+oWjztcvM8KIj2jz+VJu1lEoM0npX+N/xznpBgr1KXfcWWOCy1i80Ro0zqvlWpVxt
+EywNnT1JXrUw6mP/tc2KejeLP8GUMKJ1dMUWiD+MUCJiryBYCndcb23+8Ot74/E7
+5dTda7Pt3Y/W4ANaSD9ACTm0gHNnMFsSvkaV18b4Xud67n0IEaEWdyyxJ5dxTQyx
+eoBKA0q8iYfXt64y/p/wiNKfRc+TqkU=
+-----END CERTIFICATE-----

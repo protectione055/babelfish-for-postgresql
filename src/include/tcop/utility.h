@@ -78,6 +78,36 @@ typedef void (*ProcessUtility_hook_type) (PlannedStmt *pstmt,
 										  DestReceiver *dest, QueryCompletion *qc);
 extern PGDLLEXPORT ProcessUtility_hook_type ProcessUtility_hook;
 
+struct RemoteProcStmt;
+/*
+ * Pre-dispatch authorization hook for remote procedure execution.
+ *
+ * This hook is intended for compatibility layers that need surface-specific
+ * authorization policy before remote dispatch.  Core utility code remains
+ * policy-agnostic and only enforces generic execution invariants.
+ *
+ * Contract:
+ * - Allow: return normally.
+ * - Deny: raise ERROR in the hook implementation (hook owns error contract).
+ */
+typedef void (*remote_proc_pre_exec_auth_hook_type) (Oid userid,
+														 const char *dblinkname,
+														 Oid serverid,
+														 const struct RemoteProcStmt *stmt);
+extern PGDLLEXPORT remote_proc_pre_exec_auth_hook_type remote_proc_pre_exec_auth_hook;
+
+/*
+ * Emitted after one visible remote rowset is drained and before the next one
+ * is exposed. The hook payload is semantic rowset state only; protocol layers
+ * remain responsible for any wire-level encoding.
+ */
+typedef void (*remote_proc_result_set_boundary_hook_type) (uint64 rowcount);
+extern PGDLLEXPORT remote_proc_result_set_boundary_hook_type remote_proc_result_set_boundary_hook;
+
+typedef void (*remote_proc_return_status_hook_type) (int32 return_status,
+												  bool isnull);
+extern PGDLLEXPORT remote_proc_return_status_hook_type remote_proc_return_status_hook;
+
 extern void ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 						   bool readOnlyTree,
 						   ProcessUtilityContext context, ParamListInfo params,
