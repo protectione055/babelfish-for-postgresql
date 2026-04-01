@@ -32,10 +32,13 @@
 
 #include "access/nbtree.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/execExpr.h"
 #include "executor/nodeSubplan.h"
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
 #include "funcapi.h"
 #include "jit/jit.h"
 #include "miscadmin.h"
@@ -50,6 +53,7 @@
 #include "utils/jsonfuncs.h"
 #include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 
 
@@ -1145,6 +1149,91 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				ExecInitFunc(&scratch, node,
 							 func->args, func->funcid, func->inputcollid,
 							 state);
+				ExprEvalPushStep(state, &scratch);
+				break;
+			}
+
+		case T_DblinkFuncExpr:
+			{
+				DblinkFuncExpr *df = (DblinkFuncExpr *) node;
+				DblinkRoutineExecState *dstate;
+				Oid			serverid;
+				const char *nspname = NULL;
+				const char *proname = NULL;
+				int			nargs;
+				int			i = 0;
+				ListCell   *lc;
+				DblinkRoutineMetadata *md;
+				FdwRoutine *fdwroutine;
+
+				/* Extract (optional) schema-qualified routine name */
+				switch (list_length(df->funcname))
+				{
+					case 1:
+						proname = strVal(linitial(df->funcname));
+						break;
+					case 2:
+						nspname = strVal(linitial(df->funcname));
+						proname = strVal(lsecond(df->funcname));
+						break;
+					default:
+						elog(ERROR, "unexpected remote routine name length: %d",
+							 list_length(df->funcname));
+				}
+
+				serverid = get_dblink_server_oid(df->dblinkname, true);
+				if (!OidIsValid(serverid))
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("dblink \"%s\" does not exist", df->dblinkname)));
+
+				dstate = (DblinkRoutineExecState *) palloc0(sizeof(*dstate));
+				dstate->serverid = serverid;
+				dstate->userid = GetUserId();
+				dstate->dblinkname = df->dblinkname;
+				dstate->nspname = nspname;
+				dstate->proname = proname;
+
+				nargs = list_length(df->args);
+				dstate->nargs = nargs;
+				dstate->argtypes = (Oid *) palloc(sizeof(Oid) * nargs);
+				dstate->argtypmods = (int32 *) palloc(sizeof(int32) * nargs);
+				dstate->argvalues = (Datum *) palloc(sizeof(Datum) * nargs);
+				dstate->argnulls = (bool *) palloc(sizeof(bool) * nargs);
+
+				foreach(lc, df->args)
+				{
+					Expr	   *arg = (Expr *) lfirst(lc);
+
+					dstate->argtypes[i] = exprType((Node *) arg);
+					dstate->argtypmods[i] = exprTypmod((Node *) arg);
+
+					ExecInitExprRec(arg, state,
+									&dstate->argvalues[i],
+									&dstate->argnulls[i]);
+					i++;
+				}
+
+				md = GetCachedDblinkRoutineMetadata(dstate->serverid,
+													dstate->userid,
+													df->dblinkname,
+													nspname,
+													proname,
+													nargs,
+													dstate->argtypes,
+													dstate->argtypmods);
+
+				dstate->remote_sql = md->remote_sql;
+
+				fdwroutine = GetFdwRoutineByServerId(dstate->serverid);
+				if (fdwroutine == NULL || fdwroutine->ExecDblinkRoutine == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("FDW does not support remote routine execution via @dblink")));
+				dstate->fdwroutine = fdwroutine;
+
+				scratch.opcode = EEOP_DBLINK_FUNCEXPR;
+				scratch.d.dblink_func.state = dstate;
 				ExprEvalPushStep(state, &scratch);
 				break;
 			}

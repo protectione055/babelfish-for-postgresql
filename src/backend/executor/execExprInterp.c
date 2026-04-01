@@ -61,6 +61,7 @@
 #include "commands/sequence.h"
 #include "executor/execExpr.h"
 #include "executor/nodeSubplan.h"
+#include "foreign/fdwapi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
@@ -430,6 +431,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_FUNCEXPR_STRICT,
 		&&CASE_EEOP_FUNCEXPR_FUSAGE,
 		&&CASE_EEOP_FUNCEXPR_STRICT_FUSAGE,
+		&&CASE_EEOP_DBLINK_FUNCEXPR,
 		&&CASE_EEOP_BOOL_AND_STEP_FIRST,
 		&&CASE_EEOP_BOOL_AND_STEP,
 		&&CASE_EEOP_BOOL_AND_STEP_LAST,
@@ -801,6 +803,34 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			/* not common enough to inline */
 			ExecEvalFuncExprStrictFusage(state, op, econtext);
+
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_DBLINK_FUNCEXPR)
+		{
+			DblinkRoutineExecState *dstate = op->d.dblink_func.state;
+			bool		isnull = false;
+			Datum		d;
+
+			if (dstate->fdwroutine == NULL ||
+				dstate->fdwroutine->ExecDblinkRoutine == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("FDW does not support remote routine execution via @dblink")));
+
+			d = dstate->fdwroutine->ExecDblinkRoutine(dstate->serverid,
+										 dstate->userid,
+										 dstate->nspname,
+										 dstate->proname,
+										 dstate->remote_sql,
+										 dstate->nargs,
+										 dstate->argtypes,
+										 dstate->argvalues,
+										 dstate->argnulls,
+										 &isnull);
+			*op->resvalue = d;
+			*op->resnull = isnull;
 
 			EEO_NEXT();
 		}

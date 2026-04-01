@@ -13,6 +13,7 @@
 #define FDWAPI_H
 
 #include "access/parallel.h"
+#include "access/tupdesc.h"
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 
@@ -160,6 +161,56 @@ typedef bool (*AnalyzeForeignTable_function) (Relation relation,
 typedef List *(*ImportForeignSchema_function) (ImportForeignSchemaStmt *stmt,
 											   Oid serverOid);
 
+typedef TupleDesc (*GetDblinkTableMetadata_function) (Oid serverOid,
+										   Oid userid,
+										   const char *remote_schema,
+									   const char *remote_table);
+
+typedef bool (*GetDblinkRoutineMetadata_function) (Oid serverOid,
+										Oid userid,
+										const char *remote_schema,
+										const char *remote_routine,
+										int nargs,
+										const Oid *argtypes,
+										const int32 *argtypmods,
+										Oid *rettype,
+										int32 *rettypmod,
+										Oid *retcollid,
+										char **remote_sql);
+
+typedef Datum (*ExecDblinkRoutine_function) (Oid serverOid,
+									Oid userid,
+									const char *remote_schema,
+									const char *remote_routine,
+									const char *remote_sql,
+									int nargs,
+									const Oid *argtypes,
+									const Datum *argvalues,
+									const bool *argnulls,
+									bool *isnull);
+
+typedef void *(*ExecRemoteProc_function) (Oid serverOid,
+									Oid userid,
+									const char *remote_database,
+									const char *remote_schema,
+									const char *remote_routine,
+									int nargs,
+									const char *const *argnames,
+									const Oid *argtypes,
+									const bool *argisout,
+									const Datum *argvalues,
+									const bool *argnulls,
+									bool has_return_status_target);
+
+typedef TupleDesc (*GetRemoteProcRuntimeResultDesc_function) (void *handle);
+
+typedef bool (*FetchRemoteProcResult_function) (void *handle,
+									TupleTableSlot *slot);
+
+typedef List *(*GetRemoteProcOutputs_function) (void *handle);
+
+typedef bool (*RemoteProcHasMoreResults_function) (void *handle);
+
 typedef void (*ExecForeignTruncate_function) (List *rels,
 											  DropBehavior behavior,
 											  bool restart_seqs);
@@ -258,6 +309,18 @@ typedef struct FdwRoutine
 
 	/* Support functions for IMPORT FOREIGN SCHEMA */
 	ImportForeignSchema_function ImportForeignSchema;
+
+	/* Support functions for @dblink remote metadata */
+	GetDblinkTableMetadata_function GetDblinkTableMetadata;
+	GetDblinkRoutineMetadata_function GetDblinkRoutineMetadata;
+	ExecDblinkRoutine_function ExecDblinkRoutine;
+
+	/* Support functions for remote procedure execution */
+	ExecRemoteProc_function ExecRemoteProc;
+	GetRemoteProcRuntimeResultDesc_function GetRemoteProcRuntimeResultDesc;
+	FetchRemoteProcResult_function FetchRemoteProcResult;
+	GetRemoteProcOutputs_function GetRemoteProcOutputs;
+	RemoteProcHasMoreResults_function RemoteProcHasMoreResults;
 
 	/* Support functions for TRUNCATE */
 	ExecForeignTruncate_function ExecForeignTruncate;
