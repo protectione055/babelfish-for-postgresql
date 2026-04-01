@@ -13,6 +13,8 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/table.h"
@@ -21,23 +23,331 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/value.h"
 #include "parser/parse_func.h"
+#include "parser/parser.h"
 #include "tcop/utility.h"
+#include "lib/stringinfo.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+ObjectAddress AlterDatabaseLinkOptions(const char *dblinkname,
+									 const char *optname,
+									 const char *optvalue);
+
+static DatabaseLinkCreateArgs *build_create_dblink_args(CreateDatabaseLinkStmt *stmt);
+
+/*
+ * Parse a libpq-style conninfo string into foreign server options for the
+ * parser-facing CREATE DATABASE LINK wrapper.
+ */
+static List *
+dblink_connstr_to_server_options(const char *connstr)
+{
+	List		*options = NIL;
+	char		*work;
+	char		*p;
+
+	if (connstr == NULL)
+		return NIL;
+
+	work = pstrdup(connstr);
+	p = work;
+
+	while (*p)
+	{
+		char		*key_start;
+		char		*key_end;
+		char		*key;
+		char		*val;
+
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p == '\0')
+			break;
+
+		key_start = p;
+		while (*p && *p != '=' && !isspace((unsigned char) *p))
+			p++;
+		key_end = p;
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p != '=')
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("invalid connection string syntax")));
+		p++; /* skip '=' */
+
+		if (key_end == key_start)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("invalid connection string syntax")));
+
+		key = pnstrdup(key_start, key_end - key_start);
+
+		while (isspace((unsigned char) *p))
+			p++;
+
+		if (*p == '\'')
+		{
+			StringInfoData buf;
+
+			p++; /* skip opening quote */
+			initStringInfo(&buf);
+			while (*p)
+			{
+				if (*p == '\'')
+				{
+					if (*(p + 1) == '\'')
+					{
+						appendStringInfoChar(&buf, '\'');
+						p += 2;
+						continue;
+					}
+					p++; /* closing quote */
+					break;
+				}
+				if (*p == '\\' && *(p + 1) != '\0')
+				{
+					appendStringInfoChar(&buf, *(p + 1));
+					p += 2;
+					continue;
+				}
+				appendStringInfoChar(&buf, *p++);
+			}
+			if (*(p - 1) != '\'')
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("invalid connection string syntax")));
+			val = buf.data;
+		}
+		else
+		{
+			char	*val_start = p;
+
+			while (*p && !isspace((unsigned char) *p))
+				p++;
+			val = pnstrdup(val_start, p - val_start);
+		}
+
+		/* user/password belong in user mapping, not server options */
+		if (strcmp(key, "user") == 0 || strcmp(key, "password") == 0)
+			continue;
+
+		/* skip options that postgres_fdw filters out */
+		if (strcmp(key, "client_encoding") == 0 ||
+			strcmp(key, "fallback_application_name") == 0)
+			continue;
+
+		options = lappend(options,
+						 makeDefElem(key, (Node *) makeString(pstrdup(val)), -1));
+	}
+
+	return options;
+}
+
+/*
+ * Extract reserved dblink-only parameters from a connection string.
+ *
+ * Currently supported:
+ *   fdw=<fdw_name>
+ *
+ * The returned *clean_connstr is a normalized key=value string with the
+ * reserved parameters removed. The returned *fdwname (if any) is the value
+ * of fdw=.
+ */
+static void
+dblink_extract_connstr_params(const char *connstr,
+					 char **clean_connstr,
+					 char **fdwname,
+					 int *meta_ttl)
+{
+	char		*work;
+	char		*p;
+	StringInfoData buf;
+
+	*clean_connstr = NULL;
+	*fdwname = NULL;
+	*meta_ttl = -1;
+
+	if (connstr == NULL)
+		return;
+
+	work = pstrdup(connstr);
+	p = work;
+	initStringInfo(&buf);
+
+	while (*p)
+	{
+		char		*key_start;
+		char		*key_end;
+		char		*key;
+		char		*val;
+		bool		need_quote = false;
+		const char	*s;
+
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p == '\0')
+			break;
+
+		key_start = p;
+		while (*p && *p != '=' && !isspace((unsigned char) *p))
+			p++;
+		key_end = p;
+		while (isspace((unsigned char) *p))
+			p++;
+		if (*p != '=')
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("invalid connection string syntax")));
+		p++; /* skip '=' */
+
+		if (key_end == key_start)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("invalid connection string syntax")));
+
+		key = pnstrdup(key_start, key_end - key_start);
+
+		while (isspace((unsigned char) *p))
+			p++;
+
+		if (*p == '\'')
+		{
+			StringInfoData vbuf;
+
+			p++; /* skip opening quote */
+			initStringInfo(&vbuf);
+			while (*p)
+			{
+				if (*p == '\'')
+				{
+					if (*(p + 1) == '\'')
+					{
+						appendStringInfoChar(&vbuf, '\'');
+						p += 2;
+						continue;
+					}
+					p++; /* closing quote */
+					break;
+				}
+				if (*p == '\\' && *(p + 1) != '\0')
+				{
+					appendStringInfoChar(&vbuf, *(p + 1));
+					p += 2;
+					continue;
+				}
+				appendStringInfoChar(&vbuf, *p++);
+			}
+			if (*(p - 1) != '\'')
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("invalid connection string syntax")));
+			val = vbuf.data;
+		}
+		else
+		{
+			char	*val_start = p;
+
+			while (*p && !isspace((unsigned char) *p))
+				p++;
+			val = pnstrdup(val_start, p - val_start);
+		}
+
+		/* dblink-reserved parameter: fdw= */
+		if (pg_strcasecmp(key, "fdw") == 0)
+		{
+			if (val[0] == '\0')
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid fdw value in connection string")));
+			if (*fdwname != NULL && pg_strcasecmp(*fdwname, val) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("multiple fdw values specified in connection string")));
+			if (*fdwname == NULL)
+				*fdwname = pstrdup(val);
+			continue;
+		}
+
+		/* dblink-reserved parameter: meta_ttl= */
+		if (pg_strcasecmp(key, "meta_ttl") == 0)
+		{
+			char *endptr;
+			long val_l;
+
+			errno = 0;
+			val_l = strtol(val, &endptr, 10);
+
+			if (val[0] == '\0' || *endptr != '\0' || errno == ERANGE || val_l < -1 || val_l > INT_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid meta_ttl value in connection string")));
+
+			if (*meta_ttl != -1 && *meta_ttl != val_l)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("multiple meta_ttl values specified in connection string")));
+
+			*meta_ttl = (int) val_l;
+			continue;
+		}
+
+		if (buf.len > 0)
+			appendStringInfoChar(&buf, ' ');
+		appendStringInfo(&buf, "%s=", key);
+
+		if (val[0] == '\0')
+			need_quote = true;
+		for (s = val; *s; s++)
+		{
+			if (isspace((unsigned char) *s) || *s == '\'' || *s == '\\')
+			{
+				need_quote = true;
+				break;
+			}
+		}
+
+		if (!need_quote)
+			appendStringInfoString(&buf, val);
+		else
+		{
+			appendStringInfoChar(&buf, '\'');
+			for (s = val; *s; s++)
+			{
+				if (*s == '\'')
+					appendStringInfoString(&buf, "''");
+				else if (*s == '\\')
+					appendStringInfoString(&buf, "\\\\");
+				else
+					appendStringInfoChar(&buf, *s);
+			}
+			appendStringInfoChar(&buf, '\'');
+		}
+	}
+
+	*clean_connstr = buf.data;
+}
 
 
 typedef struct
@@ -1227,6 +1537,551 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	table_close(rel, RowExclusiveLock);
 
 	return myself;
+}
+
+/*
+ * Build mapping role for database-link auth mode.
+ */
+static RoleSpec *
+build_dblink_mapping_role(char authmode)
+{
+	RoleSpec   *mapping_role;
+
+	mapping_role = makeNode(RoleSpec);
+	if (authmode == DBLINK_AUTH_FIXED)
+	{
+		mapping_role->roletype = ROLESPEC_PUBLIC;
+		mapping_role->rolename = NULL;
+	}
+	else
+	{
+		mapping_role->roletype = ROLESPEC_CURRENT_USER;
+		mapping_role->rolename = NULL;
+	}
+	mapping_role->location = -1;
+
+	return mapping_role;
+}
+
+/*
+ * Lifecycle operation B: create or alter database-link user mapping only.
+ */
+ObjectAddress
+CreateOrAlterDatabaseLinkUserMapping(const char *servername,
+									 RoleSpec *mapping_role,
+									 List *options,
+									 bool attach_to_dblink_internal)
+{
+	ForeignServer *srv;
+	Oid			useId;
+	Oid			umId;
+
+	if (mapping_role == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("mapping role cannot be NULL")));
+
+	if (mapping_role->roletype == ROLESPEC_PUBLIC)
+		useId = ACL_ID_PUBLIC;
+	else
+		useId = get_rolespec_oid(mapping_role, false);
+
+	srv = GetForeignServerByName(servername, false);
+	umId = GetSysCacheOid2(USERMAPPINGUSERSERVER, Anum_pg_user_mapping_oid,
+						   ObjectIdGetDatum(useId),
+						   ObjectIdGetDatum(srv->serverid));
+
+	if (OidIsValid(umId))
+	{
+		AlterUserMappingStmt *alter_stmt;
+
+		alter_stmt = makeNode(AlterUserMappingStmt);
+		alter_stmt->user = mapping_role;
+		alter_stmt->servername = pstrdup(servername);
+		alter_stmt->options = options;
+
+		return AlterUserMapping(alter_stmt);
+	}
+	else
+	{
+		CreateUserMappingStmt *create_stmt;
+		ObjectAddress um_addr;
+
+		create_stmt = makeNode(CreateUserMappingStmt);
+		create_stmt->user = mapping_role;
+		create_stmt->servername = pstrdup(servername);
+		create_stmt->options = options;
+		create_stmt->if_not_exists = false;
+
+		um_addr = CreateUserMapping(create_stmt);
+
+		if (attach_to_dblink_internal)
+		{
+			Oid			dblink_id;
+			ObjectAddress dblink_addr;
+
+			dblink_id = get_dblink_oid(servername, true);
+			if (OidIsValid(dblink_id))
+			{
+				ObjectAddressSet(dblink_addr, DbLinkRelationId, dblink_id);
+				recordDependencyOn(&um_addr, &dblink_addr, DEPENDENCY_INTERNAL);
+			}
+		}
+
+		return um_addr;
+	}
+}
+
+/*
+ * Lifecycle operation C: drop database-link user mapping only.
+ */
+Oid
+DropDatabaseLinkUserMapping(const char *servername,
+						RoleSpec *mapping_role,
+						bool missing_ok)
+{
+	DropUserMappingStmt *drop_stmt;
+
+	if (mapping_role == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("mapping role cannot be NULL")));
+
+	drop_stmt = makeNode(DropUserMappingStmt);
+	drop_stmt->user = mapping_role;
+	drop_stmt->servername = pstrdup(servername);
+	drop_stmt->missing_ok = missing_ok;
+
+	return RemoveUserMapping(drop_stmt);
+}
+
+/*
+ * Lifecycle operation A: create database-link object metadata and
+ * foreign server only.
+ */
+ObjectAddress
+CreateDatabaseLinkObject(DatabaseLinkCreateArgs *args)
+{
+	Relation	rel;
+	HeapTuple	tup;
+	Datum		values[Natts_pg_dblink];
+	bool		nulls[Natts_pg_dblink];
+	Oid			dblId;
+	Oid			ownerId;
+	Oid			srvId;
+	Datum		options;
+	ObjectAddress	myself;
+	ObjectAddress	serverAddress;
+	CreateForeignServerStmt *srvstmt;
+	const char *fdwname;
+	List		*dblink_options;
+	List		*server_options;
+	char		authmode;
+
+	if (args == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("database link arguments cannot be NULL")));
+
+	if (args->dblinkname == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("database link name cannot be NULL")));
+
+	if (args->fdwname == NULL || args->fdwname[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("database link FDW name cannot be NULL")));
+
+	fdwname = args->fdwname;
+	authmode = args->authmode;
+	server_options = args->server_options;
+	dblink_options = args->dblink_options;
+
+	/* Check for duplicate database link name */
+	rel = table_open(DbLinkRelationId, RowExclusiveLock);
+
+	dblId = get_dblink_oid(args->dblinkname, true);
+	if (OidIsValid(dblId))
+	{
+		if (args->if_not_exists)
+		{
+			ObjectAddressSet(myself, DbLinkRelationId, dblId);
+			checkMembershipInCurrentExtension(&myself);
+
+			ereport(NOTICE,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("database link \"%s\" already exists, skipping",
+							args->dblinkname)));
+			table_close(rel, RowExclusiveLock);
+			return InvalidObjectAddress;
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("database link \"%s\" already exists",
+							args->dblinkname)));
+	}
+
+	/* Avoid server name conflicts */
+	srvId = get_foreign_server_oid(args->dblinkname, true);
+	if (OidIsValid(srvId))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("server \"%s\" already exists",
+						args->dblinkname)));
+
+	ownerId = GetUserId();
+
+	/* Validate the selected FDW according to caller intent. */
+	{
+		ForeignDataWrapper *fdw;
+		FdwRoutine *fdw_routine;
+		AclResult	aclresult;
+
+		fdw = GetForeignDataWrapperByName(fdwname, false);
+		aclresult = object_aclcheck(ForeignDataWrapperRelationId, fdw->fdwid,
+							ownerId, ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FDW, fdw->fdwname);
+
+		fdw_routine = GetFdwRoutine(fdw->fdwhandler);
+
+		if (args->sql_dialect == DBLINK_DIALECT_TSQL)
+		{
+			if (fdw_routine->ExecRemoteProc == NULL ||
+				fdw_routine->FetchRemoteProcResult == NULL ||
+				fdw_routine->GetRemoteProcOutputs == NULL ||
+				fdw_routine->RemoteProcHasMoreResults == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("FDW does not support linked-server remote procedure execution"),
+						 errdetail("For linked-server mode, the foreign-data wrapper \"%s\" must implement all remote procedure callbacks.",
+								   fdwname)));
+		}
+		else
+		{
+			if (fdw_routine->GetDblinkTableMetadata == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("FDW does not support database link metadata"),
+						 errdetail("The foreign-data wrapper \"%s\" lacks database link metadata hook support.",
+								   fdwname)));
+		}
+	}
+
+	/* Create foreign server for this link */
+	srvstmt = makeNode(CreateForeignServerStmt);
+	srvstmt->servername = args->dblinkname;
+	srvstmt->servertype = NULL;
+	srvstmt->version = NULL;
+	srvstmt->fdwname = pstrdup(fdwname);
+	srvstmt->if_not_exists = false;
+	srvstmt->options = server_options;
+
+	serverAddress = CreateForeignServer(srvstmt);
+	srvId = serverAddress.objectId;
+
+	/* Store db link catalog entry */
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	dblId = GetNewOidWithIndex(rel, DbLinkOidIndexId,
+							  Anum_pg_dblink_oid);
+	values[Anum_pg_dblink_oid - 1] = ObjectIdGetDatum(dblId);
+	values[Anum_pg_dblink_dblname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(args->dblinkname));
+	values[Anum_pg_dblink_dblowner - 1] = ObjectIdGetDatum(ownerId);
+	values[Anum_pg_dblink_dblserver - 1] = ObjectIdGetDatum(srvId);
+	values[Anum_pg_dblink_dblauth - 1] = CharGetDatum(authmode);
+
+	options = transformGenericOptions(DbLinkRelationId,
+							 PointerGetDatum(NULL),
+							 dblink_options,
+							 InvalidOid);
+
+	if (DatumGetPointer(options) != NULL)
+		values[Anum_pg_dblink_dbloptions - 1] = options;
+	else
+		nulls[Anum_pg_dblink_dbloptions - 1] = true;
+
+	tup = heap_form_tuple(rel->rd_att, values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	myself.classId = DbLinkRelationId;
+	myself.objectId = dblId;
+	myself.objectSubId = 0;
+
+	serverAddress.objectSubId = 0;
+	recordDependencyOn(&serverAddress, &myself, DEPENDENCY_INTERNAL);
+
+	recordDependencyOnOwner(DbLinkRelationId, dblId, ownerId);
+
+	recordDependencyOnCurrentExtension(&myself, false);
+
+	InvokeObjectPostCreateHook(DbLinkRelationId, dblId, 0);
+
+	table_close(rel, RowExclusiveLock);
+
+	return myself;
+}
+
+/*
+ * Lifecycle operation D: drop database-link object metadata and
+ * foreign server only.
+ */
+ObjectAddress
+DropDatabaseLinkObject(const char *dblinkname, bool missing_ok)
+{
+	ObjectAddress address;
+	HeapTuple	tup;
+	Form_pg_dblink dblform;
+
+	address.objectId = get_dblink_oid(dblinkname, missing_ok);
+	if (!OidIsValid(address.objectId))
+	{
+		if (missing_ok)
+		{
+			ereport(NOTICE,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("database link \"%s\" does not exist, skipping",
+							dblinkname)));
+			return InvalidObjectAddress;
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("database link \"%s\" does not exist",
+							dblinkname)));
+	}
+
+	tup = SearchSysCache1(DBLINKOID, ObjectIdGetDatum(address.objectId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database link %u", address.objectId);
+
+	dblform = (Form_pg_dblink) GETSTRUCT(tup);
+	address.classId = DbLinkRelationId;
+	address.objectSubId = 0;
+
+	if (!object_ownercheck(DbLinkRelationId, dblform->oid, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be owner of database link \"%s\"",
+						dblinkname)));
+
+	address.classId = DbLinkRelationId;
+	address.objectSubId = 0;
+	ReleaseSysCache(tup);
+
+	performDeletion(&address, DROP_RESTRICT, 0);
+
+	return address;
+}
+
+/*
+ * Create database link
+ */
+ObjectAddress
+CreateDatabaseLink(CreateDatabaseLinkStmt *stmt)
+{
+	DatabaseLinkCreateArgs *args;
+
+	args = build_create_dblink_args(stmt);
+	return CreateDatabaseLinkFromArgs(args);
+}
+
+ObjectAddress
+CreateDatabaseLinkFromArgs(DatabaseLinkCreateArgs *args)
+{
+	ObjectAddress dblink_addr;
+
+	dblink_addr = CreateDatabaseLinkObject(args);
+	if (!OidIsValid(dblink_addr.objectId))
+		return dblink_addr;
+
+	if (!args->create_user_mapping)
+		return dblink_addr;
+
+	if (args->mapping_role == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("mapping role cannot be NULL when create_user_mapping is enabled")));
+
+	/* Ensure newly-created server is visible before mapping step (A + B). */
+	CommandCounterIncrement();
+
+	(void) CreateOrAlterDatabaseLinkUserMapping(args->dblinkname,
+									 args->mapping_role,
+									 args->user_mapping_options,
+									 true);
+
+	return dblink_addr;
+}
+
+static DatabaseLinkCreateArgs *
+build_create_dblink_args(CreateDatabaseLinkStmt *stmt)
+{
+	DatabaseLinkCreateArgs *args;
+	char		*clean_connstr = NULL;
+	char		*fdwname = NULL;
+	int			meta_ttl = -1;
+	char		authmode = DBLINK_AUTH_CURRENT_USER;
+	const char *remote_user = NULL;
+
+	args = palloc0(sizeof(DatabaseLinkCreateArgs));
+
+	if (stmt->username && stmt->username->roletype == ROLESPEC_CSTRING)
+	{
+		authmode = DBLINK_AUTH_FIXED;
+		remote_user = stmt->username->rolename;
+	}
+
+	dblink_extract_connstr_params(stmt->connstr, &clean_connstr, &fdwname, &meta_ttl);
+
+	args->dblinkname = stmt->dblinkname;
+	args->if_not_exists = stmt->if_not_exists;
+	args->sql_dialect = stmt->sql_dialect;
+	args->authmode = authmode;
+	args->fdwname = fdwname ? fdwname : pstrdup("postgres_fdw");
+	args->server_options = dblink_connstr_to_server_options(clean_connstr);
+
+	if (clean_connstr)
+		args->dblink_options = lappend(args->dblink_options,
+								  makeDefElem("connstr",
+										(Node *) makeString(pstrdup(clean_connstr)),
+										-1));
+	if (meta_ttl >= 0)
+	{
+		char		buf[32];
+
+		snprintf(buf, sizeof(buf), "%d", meta_ttl);
+		args->dblink_options = lappend(args->dblink_options,
+								  makeDefElem("meta_ttl",
+										(Node *) makeString(pstrdup(buf)),
+										-1));
+	}
+
+	if (remote_user)
+		args->user_mapping_options = lappend(args->user_mapping_options,
+									 makeDefElem("user",
+											(Node *) makeString(pstrdup(remote_user)),
+											-1));
+	if (stmt->password)
+		args->user_mapping_options = lappend(args->user_mapping_options,
+									 makeDefElem("password",
+											(Node *) makeString(pstrdup(stmt->password)),
+											-1));
+
+	args->create_user_mapping = true;
+	args->mapping_role = build_dblink_mapping_role(authmode);
+
+	return args;
+}
+
+/*
+ * Drop database link
+ */
+ObjectAddress
+DropDatabaseLink(DropDatabaseLinkStmt *stmt)
+{
+	ObjectAddress dropped_addr;
+
+	dropped_addr = DropDatabaseLinkObject(stmt->dblinkname, stmt->missing_ok);
+
+	return dropped_addr;
+}
+
+/*
+ * Alter a database-link option stored in pg_dblink.
+ *
+ * The caller is responsible for passing an already-normalized option name
+ * and value.
+ */
+ObjectAddress
+AlterDatabaseLinkOptions(const char *dblinkname, const char *optname,
+						 const char *optvalue)
+{
+	Relation	rel;
+	HeapTuple	tup;
+	HeapTuple	newtup;
+	Form_pg_dblink dblform;
+	Datum		repl_val[Natts_pg_dblink];
+	bool		repl_null[Natts_pg_dblink];
+	bool		repl_repl[Natts_pg_dblink];
+	Datum		oldoptions;
+	bool		isnull;
+	Datum		newoptions;
+	List	   *oldoptionlist;
+	List	   *options = NIL;
+	DefElem    *option;
+	ListCell   *lc;
+	bool		option_exists = false;
+	ObjectAddress address;
+
+	rel = table_open(DbLinkRelationId, RowExclusiveLock);
+
+	address.objectId = get_dblink_oid(dblinkname, false);
+	tup = SearchSysCacheCopy1(DBLINKOID, ObjectIdGetDatum(address.objectId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database link %u", address.objectId);
+
+	dblform = (Form_pg_dblink) GETSTRUCT(tup);
+	address.classId = DbLinkRelationId;
+	address.objectSubId = 0;
+
+	if (!object_ownercheck(DbLinkRelationId, dblform->oid, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be owner of database link \"%s\"", dblinkname)));
+
+	oldoptions = heap_getattr(tup, Anum_pg_dblink_dbloptions,
+						  rel->rd_att, &isnull);
+	if (isnull)
+		oldoptions = PointerGetDatum(NULL);
+
+	oldoptionlist = untransformRelOptions(oldoptions);
+	foreach(lc, oldoptionlist)
+	{
+		DefElem    *def = lfirst(lc);
+
+		if (strcmp(def->defname, optname) == 0)
+		{
+			option_exists = true;
+			break;
+		}
+	}
+
+	option = makeDefElem(pstrdup(optname),
+					 (Node *) makeString(pstrdup(optvalue)),
+					 -1);
+	option->defaction = option_exists ? DEFELEM_SET : DEFELEM_ADD;
+
+	options = lappend(options, option);
+
+	newoptions = transformGenericOptions(DbLinkRelationId,
+							 oldoptions,
+							 options,
+							 InvalidOid);
+
+	memset(repl_val, 0, sizeof(repl_val));
+	memset(repl_null, false, sizeof(repl_null));
+	memset(repl_repl, false, sizeof(repl_repl));
+
+	repl_repl[Anum_pg_dblink_dbloptions - 1] = true;
+	if (DatumGetPointer(newoptions) != NULL)
+		repl_val[Anum_pg_dblink_dbloptions - 1] = newoptions;
+	else
+		repl_null[Anum_pg_dblink_dbloptions - 1] = true;
+
+	newtup = heap_modify_tuple(tup, rel->rd_att, repl_val, repl_null, repl_repl);
+	CatalogTupleUpdate(rel, &newtup->t_self, newtup);
+
+	heap_freetuple(newtup);
+	heap_freetuple(tup);
+	table_close(rel, RowExclusiveLock);
+
+	return address;
 }
 
 

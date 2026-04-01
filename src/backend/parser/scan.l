@@ -929,9 +929,17 @@ other			.
 					return NOT_EQUALS;
 				}
 
+				
 {self}			{
 					SET_YYLLOC();
 					return yytext[0];
+				}
+
+@["_A-Za-z]		{
+					/* Oracle-style database link separator: schema.table@dblink */
+					SET_YYLLOC();
+					yyless(1);
+					return DBLINK_OP;
 				}
 
 {operator}		{

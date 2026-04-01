@@ -124,6 +124,20 @@ extern ObjectAddress AlterTSConfiguration(AlterTSConfigurationStmt *stmt);
 extern text *serialize_deflist(List *deflist);
 extern List *deserialize_deflist(Datum txt);
 
+typedef struct DatabaseLinkCreateArgs
+{
+	char	   *dblinkname;
+	bool		if_not_exists;
+	DbLinkSqlDialect sql_dialect;
+	char		authmode;
+	char	   *fdwname;
+	List	   *server_options;
+	List	   *dblink_options;
+	List	   *user_mapping_options;
+	bool		create_user_mapping;
+	RoleSpec   *mapping_role;
+} DatabaseLinkCreateArgs;
+
 /* commands/foreigncmds.c */
 extern ObjectAddress AlterForeignServerOwner(const char *name, Oid newOwnerId);
 extern void AlterForeignServerOwner_oid(Oid, Oid newOwnerId);
@@ -138,6 +152,22 @@ extern ObjectAddress AlterUserMapping(AlterUserMappingStmt *stmt);
 extern Oid	RemoveUserMapping(DropUserMappingStmt *stmt);
 extern void CreateForeignTable(CreateForeignTableStmt *stmt, Oid relid);
 extern void ImportForeignSchema(ImportForeignSchemaStmt *stmt);
+extern ObjectAddress CreateDatabaseLink(CreateDatabaseLinkStmt *stmt);
+extern ObjectAddress CreateDatabaseLinkFromArgs(DatabaseLinkCreateArgs *args);
+extern ObjectAddress CreateDatabaseLinkObject(DatabaseLinkCreateArgs *args);
+extern ObjectAddress CreateOrAlterDatabaseLinkUserMapping(const char *servername,
+														  RoleSpec *mapping_role,
+														  List *options,
+														  bool attach_to_dblink_internal);
+extern Oid	DropDatabaseLinkUserMapping(const char *servername,
+								 RoleSpec *mapping_role,
+								 bool missing_ok);
+extern ObjectAddress DropDatabaseLinkObject(const char *dblinkname,
+								 bool missing_ok);
+extern ObjectAddress AlterDatabaseLinkOptions(const char *dblinkname,
+										 const char *optname,
+										 const char *optvalue);
+extern ObjectAddress DropDatabaseLink(DropDatabaseLinkStmt *stmt);
 extern Datum transformGenericOptions(Oid catalogId,
 									 Datum oldOptions,
 									 List *options,

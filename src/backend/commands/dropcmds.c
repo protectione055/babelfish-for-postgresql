@@ -322,6 +322,10 @@ does_not_exist_skipping(ObjectType objtype, Node *object, Relation relation)
 			msg = gettext_noop("schema \"%s\" does not exist, skipping");
 			name = strVal(object);
 			break;
+		case OBJECT_DATABASELINK:
+			msg = gettext_noop("database link \"%s\" does not exist, skipping");
+			name = strVal(object);
+			break;
 		case OBJECT_STATISTIC_EXT:
 			if (!schema_does_not_exist_skipping(castNode(List, object), &msg, &name))
 			{

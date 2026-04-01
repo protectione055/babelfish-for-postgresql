@@ -229,6 +229,7 @@ static	void			check_raise_parameters(PLpgSQL_stmt_raise *stmt);
  * here anyway.
  */
 %token <str>	IDENT UIDENT FCONST SCONST USCONST BCONST XCONST Op
+%token			DBLINK_OP
 %token <ival>	ICONST PARAM
 %token			TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER
 %token			LESS_EQUALS GREATER_EQUALS NOT_EQUALS
