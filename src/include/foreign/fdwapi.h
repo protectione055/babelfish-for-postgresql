@@ -191,6 +191,28 @@ typedef void (*ForeignAsyncConfigureWait_function) (AsyncRequest *areq);
 
 typedef void (*ForeignAsyncNotify_function) (AsyncRequest *areq);
 
+typedef void *(*ExecRemoteProc_function) (Oid serverOid,
+										  Oid userid,
+										  const char *remote_database,
+										  const char *remote_schema,
+										  const char *remote_routine,
+										  int nargs,
+										  const char *const *argnames,
+										  const Oid *argtypes,
+										  const bool *argisout,
+										  const Datum *argvalues,
+										  const bool *argnulls,
+										  bool has_return_status_target);
+
+typedef TupleDesc (*GetRemoteProcRuntimeResultDesc_function) (void *handle);
+
+typedef bool (*FetchRemoteProcResult_function) (void *handle,
+												TupleTableSlot *slot);
+
+typedef List *(*GetRemoteProcOutputs_function) (void *handle);
+
+typedef bool (*RemoteProcHasMoreResults_function) (void *handle);
+
 /*
  * FdwRoutine is the struct returned by a foreign-data wrapper's handler
  * function.  It provides pointers to the callback functions needed by the
@@ -258,6 +280,13 @@ typedef struct FdwRoutine
 
 	/* Support functions for IMPORT FOREIGN SCHEMA */
 	ImportForeignSchema_function ImportForeignSchema;
+
+	/* Support functions for remote procedure execution */
+	ExecRemoteProc_function ExecRemoteProc;
+	GetRemoteProcRuntimeResultDesc_function GetRemoteProcRuntimeResultDesc;
+	FetchRemoteProcResult_function FetchRemoteProcResult;
+	GetRemoteProcOutputs_function GetRemoteProcOutputs;
+	RemoteProcHasMoreResults_function RemoteProcHasMoreResults;
 
 	/* Support functions for TRUNCATE */
 	ExecForeignTruncate_function ExecForeignTruncate;

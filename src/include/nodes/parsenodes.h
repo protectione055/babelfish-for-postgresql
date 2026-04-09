@@ -2282,6 +2282,7 @@ typedef enum ObjectType
 	OBJECT_COLLATION,
 	OBJECT_CONVERSION,
 	OBJECT_DATABASE,
+	OBJECT_DATABASELINK,
 	OBJECT_DEFAULT,
 	OBJECT_DEFACL,
 	OBJECT_DOMAIN,
@@ -2949,6 +2950,23 @@ typedef struct DropUserMappingStmt
 	bool		missing_ok;		/* ignore missing mappings */
 } DropUserMappingStmt;
 
+typedef struct CreateDatabaseLinkStmt
+{
+	NodeTag		type;
+	char	   *dblinkname;
+	bool		if_not_exists;
+	RoleSpec   *username;
+	char	   *password;
+	char	   *connstr;
+} CreateDatabaseLinkStmt;
+
+typedef struct DropDatabaseLinkStmt
+{
+	NodeTag		type;
+	char	   *dblinkname;
+	bool		missing_ok;
+} DropDatabaseLinkStmt;
+
 /* ----------------------
  *		Import Foreign Schema Statement
  * ----------------------
@@ -3547,6 +3565,15 @@ typedef struct CallStmt
 	void 	   *retdesc; 		/* expected TupleDesc of the result rows */
 	void 	   *dest; 			/* DestReceiver to send the result rows */
 } CallStmt;
+
+typedef struct RemoteProcStmt
+{
+	NodeTag		type;
+	List	   *remote_name;
+	List	   *args;
+	Node	   *return_var;
+	ParseLoc	location;
+} RemoteProcStmt;
 
 typedef struct CallContext
 {

@@ -124,6 +124,16 @@ extern ObjectAddress AlterTSConfiguration(AlterTSConfigurationStmt *stmt);
 extern text *serialize_deflist(List *deflist);
 extern List *deserialize_deflist(Datum txt);
 
+typedef struct DatabaseLinkCreateArgs
+{
+	char	   *dblinkname;
+	bool		if_not_exists;
+	char		authmode;
+	char	   *fdwname;
+	List	   *server_options;
+	List	   *dblink_options;
+}			DatabaseLinkCreateArgs;
+
 /* commands/foreigncmds.c */
 extern ObjectAddress AlterForeignServerOwner(const char *name, Oid newOwnerId);
 extern void AlterForeignServerOwner_oid(Oid, Oid newOwnerId);
@@ -138,6 +148,11 @@ extern ObjectAddress AlterUserMapping(AlterUserMappingStmt *stmt);
 extern Oid	RemoveUserMapping(DropUserMappingStmt *stmt);
 extern void CreateForeignTable(CreateForeignTableStmt *stmt, Oid relid);
 extern void ImportForeignSchema(ImportForeignSchemaStmt *stmt);
+extern ObjectAddress CreateDatabaseLink(DatabaseLinkCreateArgs * args);
+extern ObjectAddress DropDatabaseLink(DropDatabaseLinkStmt *stmt);
+extern ObjectAddress AlterDatabaseLinkOptions(const char *dblinkname,
+											  const char *optname,
+											  const char *optvalue);
 extern Datum transformGenericOptions(Oid catalogId,
 									 Datum oldOptions,
 									 List *options,

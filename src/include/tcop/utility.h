@@ -78,6 +78,21 @@ typedef void (*ProcessUtility_hook_type) (PlannedStmt *pstmt,
 										  DestReceiver *dest, QueryCompletion *qc);
 extern PGDLLEXPORT ProcessUtility_hook_type ProcessUtility_hook;
 
+struct RemoteProcStmt;
+
+typedef void (*remote_proc_pre_exec_auth_hook_type) (Oid userid,
+													 const char *dblinkname,
+													 Oid serverid,
+													 const struct RemoteProcStmt *stmt);
+extern PGDLLEXPORT remote_proc_pre_exec_auth_hook_type remote_proc_pre_exec_auth_hook;
+
+typedef void (*remote_proc_result_set_boundary_hook_type) (uint64 rowcount);
+extern PGDLLEXPORT remote_proc_result_set_boundary_hook_type remote_proc_result_set_boundary_hook;
+
+typedef void (*remote_proc_return_status_hook_type) (int32 return_status,
+													 bool isnull);
+extern PGDLLEXPORT remote_proc_return_status_hook_type remote_proc_return_status_hook;
+
 extern void ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 						   bool readOnlyTree,
 						   ProcessUtilityContext context, ParamListInfo params,

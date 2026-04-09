@@ -33,6 +33,7 @@
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
@@ -286,6 +287,20 @@ static const ObjectPropertyType ObjectProperty[] =
 		Anum_pg_foreign_server_srvowner,
 		Anum_pg_foreign_server_srvacl,
 		OBJECT_FOREIGN_SERVER,
+		true
+	},
+	{
+		"database link",
+		DbLinkRelationId,
+		DbLinkOidIndexId,
+		DBLINKOID,
+		DBLINKNAME,
+		Anum_pg_dblink_oid,
+		Anum_pg_dblink_dblname,
+		InvalidAttrNumber,
+		Anum_pg_dblink_dblowner,
+		InvalidAttrNumber,
+		OBJECT_DATABASELINK,
 		true
 	},
 	{
@@ -1006,6 +1021,7 @@ get_object_address(ObjectType objtype, Node *object,
 				}
 				break;
 			case OBJECT_DATABASE:
+			case OBJECT_DATABASELINK:
 			case OBJECT_EXTENSION:
 			case OBJECT_TABLESPACE:
 			case OBJECT_ROLE:
@@ -1274,6 +1290,11 @@ get_object_address_unqualified(ObjectType objtype,
 			address.objectId = get_database_oid(name, missing_ok);
 			address.objectSubId = 0;
 			break;
+		case OBJECT_DATABASELINK:
+			address.classId = DbLinkRelationId;
+			address.objectId = get_dblink_oid(name, missing_ok);
+			address.objectSubId = 0;
+			break;
 		case OBJECT_EXTENSION:
 			address.classId = ExtensionRelationId;
 			address.objectId = get_extension_oid(name, missing_ok);
@@ -1500,6 +1521,7 @@ get_object_address_relobject(ObjectType objtype, List *object,
 	*relp = relation;
 	return address;
 }
+
 /*
  * Find the ObjectAddress for an attribute.
  */
@@ -2304,6 +2326,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 			break;
 		case OBJECT_ACCESS_METHOD:
 		case OBJECT_DATABASE:
+		case OBJECT_DATABASELINK:
 		case OBJECT_EVENT_TRIGGER:
 		case OBJECT_EXTENSION:
 		case OBJECT_FDW:
@@ -2451,6 +2474,7 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 							   NameListToString((castNode(ObjectWithArgs, object))->objname));
 			break;
 		case OBJECT_DATABASE:
+		case OBJECT_DATABASELINK:
 		case OBJECT_EVENT_TRIGGER:
 		case OBJECT_EXTENSION:
 		case OBJECT_FDW:
@@ -3728,6 +3752,28 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+		case DbLinkRelationId:
+			{
+				HeapTuple	tup;
+				Form_pg_dblink dblform;
+
+				tup = SearchSysCache1(DBLINKOID,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for database link %u",
+							 object->objectId);
+					break;
+				}
+
+				dblform = (Form_pg_dblink) GETSTRUCT(tup);
+				appendStringInfo(&buffer, _("database link %s"),
+								 NameStr(dblform->dblname));
+				ReleaseSysCache(tup);
+				break;
+			}
+
 		case UserMappingRelationId:
 			{
 				HeapTuple	tup;
@@ -4553,6 +4599,10 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 
 		case ForeignServerRelationId:
 			appendStringInfoString(&buffer, "server");
+			break;
+
+		case DbLinkRelationId:
+			appendStringInfoString(&buffer, "database link");
 			break;
 
 		case UserMappingRelationId:
@@ -5590,6 +5640,30 @@ getObjectIdentityParts(const ObjectAddress *object,
 					if (objname)
 						*objname = list_make1(pstrdup(srv->servername));
 				}
+				break;
+			}
+
+		case DbLinkRelationId:
+			{
+				HeapTuple	tup;
+				Form_pg_dblink dblform;
+
+				tup = SearchSysCache1(DBLINKOID,
+									  ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "cache lookup failed for database link %u",
+							 object->objectId);
+					break;
+				}
+
+				dblform = (Form_pg_dblink) GETSTRUCT(tup);
+				appendStringInfoString(&buffer,
+									   quote_identifier(NameStr(dblform->dblname)));
+				if (objname)
+					*objname = list_make1(pstrdup(NameStr(dblform->dblname)));
+				ReleaseSysCache(tup);
 				break;
 			}
 

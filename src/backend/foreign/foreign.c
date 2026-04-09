@@ -12,12 +12,17 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
+#include "access/tableam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
+#include "commands/defrem.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
@@ -557,6 +562,106 @@ pg_options_to_table(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/*
+ * GetDatabaseLinkOptions - look up pg_dblink options by OID.
+ */
+List *
+GetDatabaseLinkOptions(Oid dblinkid)
+{
+	HeapTuple	tup;
+	Datum		datum;
+	bool		isnull;
+	List	   *options;
+
+	tup = SearchSysCache1(DBLINKOID, ObjectIdGetDatum(dblinkid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database link %u", dblinkid);
+
+	datum = SysCacheGetAttr(DBLINKOID,
+							 tup,
+							 Anum_pg_dblink_dbloptions,
+							 &isnull);
+	if (isnull)
+		options = NIL;
+	else
+		options = untransformRelOptions(datum);
+
+	ReleaseSysCache(tup);
+
+	return options;
+}
+
+/*
+ * GetDatabaseLinkOptionsByName - look up pg_dblink options by dblink name.
+ */
+List *
+GetDatabaseLinkOptionsByName(const char *dblinkname, bool missing_ok)
+{
+	Oid			dblinkid;
+
+	dblinkid = get_dblink_oid(dblinkname, missing_ok);
+	if (!OidIsValid(dblinkid))
+		return NIL;
+
+	return GetDatabaseLinkOptions(dblinkid);
+}
+
+/*
+ * get_dblink_option_int - parse named integer option from dblink options.
+ */
+int
+get_dblink_option_int(List *options, const char *name, int default_value)
+{
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (pg_strcasecmp(def->defname, name) != 0)
+			continue;
+
+		if (def->arg == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid integer value for linked server option \"%s\"", name)));
+
+		return pg_strtoint32(defGetString(def));
+	}
+
+	return default_value;
+}
+
+/*
+ * get_dblink_option_bool - parse named boolean option from dblink options.
+ */
+bool
+get_dblink_option_bool(List *options, const char *name, bool default_value)
+{
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+		bool		parsed_value;
+
+		if (pg_strcasecmp(def->defname, name) != 0)
+			continue;
+
+		if (def->arg == NULL)
+			return true;
+
+		if (!parse_bool(defGetString(def), &parsed_value))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid boolean value for linked server option \"%s\"", name)));
+
+		return parsed_value;
+	}
+
+	return default_value;
+}
+
 
 /*
  * Describes the valid options for postgresql FDW, server, and user mapping.
@@ -712,6 +817,83 @@ get_foreign_server_oid(const char *servername, bool missing_ok)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("server \"%s\" does not exist", servername)));
 	return oid;
+}
+
+/*
+ * get_dblink_oid - given a dblink name, look up the OID
+ */
+Oid
+get_dblink_oid(const char *dblinkname, bool missing_ok)
+{
+	Oid			oid;
+
+	oid = GetSysCacheOid1(DBLINKNAME, Anum_pg_dblink_oid,
+						  CStringGetDatum(dblinkname));
+	if (!OidIsValid(oid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database link \"%s\" does not exist", dblinkname)));
+	return oid;
+}
+
+/*
+ * get_dblink_oid_by_server_oid - look up dblink OID by foreign server OID.
+ */
+Oid
+get_dblink_oid_by_server_oid(Oid serverid, bool missing_ok)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	Oid			dblinkid = InvalidOid;
+
+	rel = table_open(DbLinkRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_dblink dblinkform = (Form_pg_dblink) GETSTRUCT(tup);
+
+		if (dblinkform->dblserver != serverid)
+			continue;
+
+		dblinkid = dblinkform->oid;
+		break;
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	if (!OidIsValid(dblinkid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database link for server with OID %u does not exist", serverid)));
+
+	return dblinkid;
+}
+
+/*
+ * get_dblink_server_oid - given a dblink name, look up the foreign server OID
+ */
+Oid
+get_dblink_server_oid(const char *dblinkname, bool missing_ok)
+{
+	Oid			dblinkid;
+	HeapTuple	tup;
+	Oid			serverid;
+
+	dblinkid = get_dblink_oid(dblinkname, missing_ok);
+	if (!OidIsValid(dblinkid))
+		return InvalidOid;
+
+	tup = SearchSysCache1(DBLINKOID, ObjectIdGetDatum(dblinkid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database link %u", dblinkid);
+
+	serverid = ((Form_pg_dblink) GETSTRUCT(tup))->dblserver;
+	ReleaseSysCache(tup);
+
+	return serverid;
 }
 
 /*

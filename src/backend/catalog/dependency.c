@@ -36,6 +36,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
@@ -1365,6 +1366,27 @@ doDeletion(const ObjectAddress *object, int flags)
 {
 	switch (object->classId)
 	{
+		case DbLinkRelationId:
+			{
+				Relation	rel;
+				HeapTuple	tup;
+
+				Assert(object->objectSubId == 0);
+
+				rel = table_open(DbLinkRelationId, RowExclusiveLock);
+				tup = SearchSysCache1(DBLINKOID, ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(tup))
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("cache lookup failed for database link %u",
+									object->objectId)));
+
+				CatalogTupleDelete(rel, &tup->t_self);
+				ReleaseSysCache(tup);
+				table_close(rel, RowExclusiveLock);
+				break;
+			}
+
 		case RelationRelationId:
 			{
 				char		relKind = get_rel_relkind(object->objectId);

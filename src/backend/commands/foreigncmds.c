@@ -13,6 +13,8 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/table.h"
@@ -21,20 +23,28 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_dblink.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/value.h"
 #include "parser/parse_func.h"
 #include "tcop/utility.h"
+#include "lib/stringinfo.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -1227,6 +1237,271 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	table_close(rel, RowExclusiveLock);
 
 	return myself;
+}
+
+ObjectAddress
+CreateDatabaseLink(DatabaseLinkCreateArgs * args)
+{
+	Relation	rel;
+	HeapTuple	tup;
+	Datum		values[Natts_pg_dblink];
+	bool		nulls[Natts_pg_dblink];
+	Oid			dblId;
+	Oid			ownerId;
+	Oid			srvId;
+	Datum		options;
+	ObjectAddress myself;
+	ObjectAddress serverAddress;
+	CreateForeignServerStmt *srvstmt;
+	const char *fdwname;
+	List	   *dblink_options;
+	List	   *server_options;
+	char		authmode;
+
+	if (args == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("database link arguments cannot be NULL")));
+
+	if (args->dblinkname == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("database link name cannot be NULL")));
+
+	if (args->fdwname == NULL || args->fdwname[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("database link FDW name cannot be NULL")));
+
+	fdwname = args->fdwname;
+	authmode = args->authmode;
+	server_options = args->server_options;
+	dblink_options = args->dblink_options;
+
+	rel = table_open(DbLinkRelationId, RowExclusiveLock);
+
+	dblId = get_dblink_oid(args->dblinkname, true);
+	if (OidIsValid(dblId))
+	{
+		if (args->if_not_exists)
+		{
+			ObjectAddressSet(myself, DbLinkRelationId, dblId);
+			checkMembershipInCurrentExtension(&myself);
+
+			ereport(NOTICE,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("database link \"%s\" already exists, skipping",
+							args->dblinkname)));
+			table_close(rel, RowExclusiveLock);
+			return InvalidObjectAddress;
+		}
+
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("database link \"%s\" already exists",
+						args->dblinkname)));
+	}
+
+	srvId = get_foreign_server_oid(args->dblinkname, true);
+	if (OidIsValid(srvId))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("server \"%s\" already exists",
+						args->dblinkname)));
+
+	ownerId = GetUserId();
+
+	srvstmt = makeNode(CreateForeignServerStmt);
+	srvstmt->servername = args->dblinkname;
+	srvstmt->servertype = NULL;
+	srvstmt->version = NULL;
+	srvstmt->fdwname = pstrdup(fdwname);
+	srvstmt->if_not_exists = false;
+	srvstmt->options = server_options;
+
+	serverAddress = CreateForeignServer(srvstmt);
+	srvId = serverAddress.objectId;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	dblId = GetNewOidWithIndex(rel, DbLinkOidIndexId,
+							   Anum_pg_dblink_oid);
+	values[Anum_pg_dblink_oid - 1] = ObjectIdGetDatum(dblId);
+	values[Anum_pg_dblink_dblname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(args->dblinkname));
+	values[Anum_pg_dblink_dblowner - 1] = ObjectIdGetDatum(ownerId);
+	values[Anum_pg_dblink_dblserver - 1] = ObjectIdGetDatum(srvId);
+	values[Anum_pg_dblink_dblauth - 1] = CharGetDatum(authmode);
+
+	options = transformGenericOptions(DbLinkRelationId,
+									  PointerGetDatum(NULL),
+									  dblink_options,
+									  InvalidOid);
+
+	if (DatumGetPointer(options) != NULL)
+		values[Anum_pg_dblink_dbloptions - 1] = options;
+	else
+		nulls[Anum_pg_dblink_dbloptions - 1] = true;
+
+	tup = heap_form_tuple(rel->rd_att, values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	myself.classId = DbLinkRelationId;
+	myself.objectId = dblId;
+	myself.objectSubId = 0;
+
+	serverAddress.objectSubId = 0;
+	recordDependencyOn(&serverAddress, &myself, DEPENDENCY_INTERNAL);
+	recordDependencyOnOwner(DbLinkRelationId, dblId, ownerId);
+	recordDependencyOnCurrentExtension(&myself, false);
+	InvokeObjectPostCreateHook(DbLinkRelationId, dblId, 0);
+
+	table_close(rel, RowExclusiveLock);
+
+	return myself;
+}
+
+ObjectAddress
+DropDatabaseLink(DropDatabaseLinkStmt *stmt)
+{
+	const char *dblinkname;
+	bool		missing_ok;
+	ObjectAddress address;
+	HeapTuple	tup;
+	Form_pg_dblink dblform;
+
+	if (stmt == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("drop database link statement cannot be NULL")));
+
+	dblinkname = stmt->dblinkname;
+	missing_ok = stmt->missing_ok;
+
+	address.objectId = get_dblink_oid(dblinkname, missing_ok);
+	if (!OidIsValid(address.objectId))
+	{
+		if (missing_ok)
+		{
+			ereport(NOTICE,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("database link \"%s\" does not exist, skipping",
+							dblinkname)));
+			return InvalidObjectAddress;
+		}
+
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database link \"%s\" does not exist",
+						dblinkname)));
+	}
+
+	tup = SearchSysCache1(DBLINKOID, ObjectIdGetDatum(address.objectId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database link %u", address.objectId);
+
+	dblform = (Form_pg_dblink) GETSTRUCT(tup);
+	address.classId = DbLinkRelationId;
+	address.objectSubId = 0;
+
+	if (!object_ownercheck(DbLinkRelationId, dblform->oid, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be owner of database link \"%s\"",
+						dblinkname)));
+
+	ReleaseSysCache(tup);
+
+	performDeletion(&address, DROP_RESTRICT, 0);
+
+	return address;
+}
+
+ObjectAddress
+AlterDatabaseLinkOptions(const char *dblinkname, const char *optname,
+						 const char *optvalue)
+{
+	Relation	rel;
+	HeapTuple	tup;
+	HeapTuple	newtup;
+	Form_pg_dblink dblform;
+	Datum		repl_val[Natts_pg_dblink];
+	bool		repl_null[Natts_pg_dblink];
+	bool		repl_repl[Natts_pg_dblink];
+	Datum		oldoptions;
+	bool		isnull;
+	Datum		newoptions;
+	List	   *oldoptionlist;
+	List	   *options = NIL;
+	DefElem    *option;
+	ListCell   *lc;
+	bool		option_exists = false;
+	ObjectAddress address;
+
+	rel = table_open(DbLinkRelationId, RowExclusiveLock);
+
+	address.objectId = get_dblink_oid(dblinkname, false);
+	tup = SearchSysCacheCopy1(DBLINKOID, ObjectIdGetDatum(address.objectId));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database link %u", address.objectId);
+
+	dblform = (Form_pg_dblink) GETSTRUCT(tup);
+	address.classId = DbLinkRelationId;
+	address.objectSubId = 0;
+
+	if (!object_ownercheck(DbLinkRelationId, dblform->oid, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be owner of database link \"%s\"", dblinkname)));
+
+	oldoptions = heap_getattr(tup, Anum_pg_dblink_dbloptions,
+							  rel->rd_att, &isnull);
+	if (isnull)
+		oldoptions = PointerGetDatum(NULL);
+
+	oldoptionlist = untransformRelOptions(oldoptions);
+	foreach(lc, oldoptionlist)
+	{
+		DefElem    *def = lfirst(lc);
+
+		if (strcmp(def->defname, optname) == 0)
+		{
+			option_exists = true;
+			break;
+		}
+	}
+
+	option = makeDefElem(pstrdup(optname),
+						 (Node *) makeString(pstrdup(optvalue)),
+						 -1);
+	option->defaction = option_exists ? DEFELEM_SET : DEFELEM_ADD;
+	options = lappend(options, option);
+
+	newoptions = transformGenericOptions(DbLinkRelationId,
+										 oldoptions,
+										 options,
+										 InvalidOid);
+
+	memset(repl_val, 0, sizeof(repl_val));
+	memset(repl_null, false, sizeof(repl_null));
+	memset(repl_repl, false, sizeof(repl_repl));
+
+	repl_repl[Anum_pg_dblink_dbloptions - 1] = true;
+	if (DatumGetPointer(newoptions) != NULL)
+		repl_val[Anum_pg_dblink_dbloptions - 1] = newoptions;
+	else
+		repl_null[Anum_pg_dblink_dbloptions - 1] = true;
+
+	newtup = heap_modify_tuple(tup, rel->rd_att, repl_val, repl_null, repl_repl);
+	CatalogTupleUpdate(rel, &newtup->t_self, newtup);
+
+	heap_freetuple(newtup);
+	heap_freetuple(tup);
+	table_close(rel, RowExclusiveLock);
+
+	return address;
 }
 
 

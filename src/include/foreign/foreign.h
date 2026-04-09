@@ -78,7 +78,19 @@ extern ForeignDataWrapper *GetForeignDataWrapperByName(const char *fdwname,
 extern ForeignTable *GetForeignTable(Oid relid);
 
 extern List *GetForeignColumnOptions(Oid relid, AttrNumber attnum);
+extern List *GetDatabaseLinkOptions(Oid dblinkid);
+extern List *GetDatabaseLinkOptionsByName(const char *dblinkname,
+									 bool missing_ok);
+extern int	get_dblink_option_int(List *options,
+						 const char *name,
+						 int default_value);
+extern bool get_dblink_option_bool(List *options,
+						  const char *name,
+						  bool default_value);
 
+extern Oid	get_dblink_oid(const char *dblinkname, bool missing_ok);
+extern Oid	get_dblink_oid_by_server_oid(Oid serverid, bool missing_ok);
+extern Oid	get_dblink_server_oid(const char *dblinkname, bool missing_ok);
 extern Oid	get_foreign_data_wrapper_oid(const char *fdwname, bool missing_ok);
 extern Oid	get_foreign_server_oid(const char *servername, bool missing_ok);
 
